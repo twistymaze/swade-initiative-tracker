@@ -1,47 +1,41 @@
 import { useEffect } from "react";
-import { Provider } from 'react-redux';
+import { Provider } from "react-redux";
 import { InitiativeTracker } from "./InitiativeTracker";
-import { store, initializeStoreIfNeeded, cleanupStoreSubscriptions } from "./store/store";
+import { startSync, store } from "./store/store";
 import { AddParticipantModal } from "./components/AddParticipantModal";
 import { CardChooserModal } from "./components/CardChooserModal";
-import { PluginGate } from "./components/PluginGate";
 import { UndoProvider } from "./contexts/UndoContext";
 import { AppErrorBoundary } from "./components/AppErrorBoundary";
+import { SyncStatusGate } from "./components/SyncStatusGate";
 
-function AppContent() {
-  const pathname = window.location.pathname;
+/** Which view this iframe shows: `/?view=add-participant`, `/?view=card-chooser&participantId=…`, or the tracker. */
+function getView(): string | null {
+  return new URLSearchParams(window.location.search).get("view");
+}
 
-  // Initialize store with OBR room state (no scene required)
+/** Rendered inside PluginGate (main.tsx), so OBR is ready. */
+export function App() {
   useEffect(() => {
-    initializeStoreIfNeeded();
-    
-    // Cleanup subscriptions on unmount
-    return () => {
-      cleanupStoreSubscriptions();
-    };
+    startSync().catch((error) => console.error("[sync] failed to start", error));
   }, []);
+
+  const view = getView();
 
   return (
     <Provider store={store}>
       <AppErrorBoundary>
-        <UndoProvider>
-          {pathname === '/add-participant' ? (
-            <AddParticipantModal />
-          ) : pathname === '/card-chooser' ? (
-            <CardChooserModal />
-          ) : (
-            <InitiativeTracker />
-          )}
-        </UndoProvider>
+        <SyncStatusGate>
+          <UndoProvider>
+            {view === "add-participant" ? (
+              <AddParticipantModal />
+            ) : view === "card-chooser" ? (
+              <CardChooserModal />
+            ) : (
+              <InitiativeTracker />
+            )}
+          </UndoProvider>
+        </SyncStatusGate>
       </AppErrorBoundary>
     </Provider>
-  );
-}
-
-export function App() {
-  return (
-    <PluginGate>
-      <AppContent />
-    </PluginGate>
   );
 }

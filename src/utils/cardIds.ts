@@ -6,6 +6,14 @@ import { CardId, Suit, Rank, Card } from "../store/types";
 export const RED_JOKER_ID = 'JK-R' as const;
 export const BLACK_JOKER_ID = 'JK-B' as const;
 
+/** Suits in SWADE precedence order (Spades > Hearts > Diamonds > Clubs) */
+export const SUITS: readonly Suit[] = ['S', 'H', 'D', 'C'];
+
+/** Ranks from high to low (Ace high) */
+export const RANKS: readonly Rank[] = ['A', 'K', 'Q', 'J', '10', '9', '8', '7', '6', '5', '4', '3', '2'];
+
+const SUIT_SYMBOLS: Record<Suit, string> = { S: '♠', H: '♥', D: '♦', C: '♣' };
+
 /**
  * Generate deterministic card ID from rank and suit
  * Examples: "AS" (Ace of Spades), "10H" (Ten of Hearts), "JK-R" (Red Joker)
@@ -17,27 +25,22 @@ export function getCardId(rank: Rank | 'JOKER', suit?: Suit, jokerColor?: 'RED' 
   return `${rank}${suit}`;
 }
 
+/** True when the card ID is either Joker */
+export function isJokerId(cardId: CardId | null | undefined): boolean {
+  return cardId === RED_JOKER_ID || cardId === BLACK_JOKER_ID;
+}
 
 /**
  * Generate all card IDs for a standard 54-card deck
  */
 export function generateAllCardIds(): CardId[] {
-  const suits: Suit[] = ['S', 'H', 'D', 'C'];
-  const ranks: Rank[] = ['A', 'K', 'Q', 'J', '10', '9', '8', '7', '6', '5', '4', '3', '2'];
-  
   const cardIds: CardId[] = [];
-  
-  // Add all regular cards
-  for (const suit of suits) {
-    for (const rank of ranks) {
+  for (const suit of SUITS) {
+    for (const rank of RANKS) {
       cardIds.push(getCardId(rank, suit));
     }
   }
-  
-  // Add Jokers
-  cardIds.push(getCardId('JOKER', undefined, 'RED'));
-  cardIds.push(getCardId('JOKER', undefined, 'BLACK'));
-  
+  cardIds.push(RED_JOKER_ID, BLACK_JOKER_ID);
   return cardIds;
 }
 
@@ -46,45 +49,29 @@ export function generateAllCardIds(): CardId[] {
  */
 export function buildCardsLookup(): Record<CardId, Card> {
   const cards: Record<CardId, Card> = {};
-  
-  // Suit symbols
-  const suitSymbols = {
-    'S': '♠',
-    'H': '♥', 
-    'D': '♦',
-    'C': '♣'
-  };
-  
-  const suits: Suit[] = ['S', 'H', 'D', 'C'];
-  const ranks: Rank[] = ['A', 'K', 'Q', 'J', '10', '9', '8', '7', '6', '5', '4', '3', '2'];
-  
-  // Create all regular cards
-  for (const suit of suits) {
-    for (const rank of ranks) {
+
+  for (const suit of SUITS) {
+    for (const rank of RANKS) {
       const cardId = getCardId(rank, suit);
-      cards[cardId] = {
-        id: cardId,
-        rank,
-        suit,
-        label: `${rank}${suitSymbols[suit]}`
-      };
+      cards[cardId] = { id: cardId, rank, suit, label: `${rank}${SUIT_SYMBOLS[suit]}` };
     }
   }
-  
-  // Add Jokers
-  cards[RED_JOKER_ID] = {
-    id: RED_JOKER_ID,
-    rank: 'JOKER',
-    jokerColor: 'RED',
-    label: 'Joker'
-  };
-  
-  cards[BLACK_JOKER_ID] = {
-    id: BLACK_JOKER_ID,
-    rank: 'JOKER', 
-    jokerColor: 'BLACK',
-    label: 'Joker'
-  };
-  
+
+  cards[RED_JOKER_ID] = { id: RED_JOKER_ID, rank: 'JOKER', jokerColor: 'RED', label: 'Joker' };
+  cards[BLACK_JOKER_ID] = { id: BLACK_JOKER_ID, rank: 'JOKER', jokerColor: 'BLACK', label: 'Joker' };
+
   return cards;
+}
+
+/** Static lookup of all 54 cards (never changes). */
+export const CARDS: Readonly<Record<CardId, Card>> = buildCardsLookup();
+
+/**
+ * Text name of a card for screen readers and tooltips. The Jokers share the visible label
+ * "Joker" (only the colour differs), so their names say the colour.
+ */
+export function getCardName(cardId: CardId): string {
+  if (cardId === RED_JOKER_ID) return 'Red Joker';
+  if (cardId === BLACK_JOKER_ID) return 'Black Joker';
+  return CARDS[cardId]?.label ?? cardId;
 }

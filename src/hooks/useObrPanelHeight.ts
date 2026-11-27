@@ -1,12 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import OBR from "@owlbear-rodeo/sdk";
-import { useAppSelector } from "../store/hooks";
 
 const HEIGHT_EPSILON = 1; // px
+/** The action height in public/manifest.json (the maximum popover height). */
+export const MANIFEST_HEIGHT = 600;
 
 /**
- * Mirrors the natural layout height of the panel into the Owlbear Rodeo iframe.
+ * Mirrors the natural layout height of the panel into the Owlbear Rodeo action popover.
+ * Resize and mutation observers catch every layout change, so no Redux subscription is needed.
+ * On unmount the popover height goes back to the manifest height.
  */
 export function useObrPanelHeight(debug = false) {
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -16,182 +19,96 @@ export function useObrPanelHeight(debug = false) {
   const measurementFrame = useRef<number | null>(null);
   const [maxHeight, setMaxHeight] = useState<number | undefined>(undefined);
 
-  // Subscribe to all Redux state changes
-  const state = useAppSelector(state => state);
-
   const log = useCallback(
     (...args: unknown[]) => {
-      if (debug) {
-        console.debug("[Resize]", ...args);
-      }
+      if (debug) console.debug("[Resize]", ...args);
     },
     [debug]
   );
 
   const measureContentHeight = useCallback(() => {
     const containerEl = containerRef.current;
-    if (!containerEl) {
-      return null;
-    }
+    if (!containerEl) return null;
 
     const participantEl = participantListRef.current;
     const participantClient = participantEl?.clientHeight ?? 0;
     const participantScroll = participantEl?.scrollHeight ?? participantClient;
-    const participantOverflow = participantScroll - participantClient;
-    const rawHeight =
-      containerEl.scrollHeight - participantClient + participantScroll;
-    const contentHeight = Math.ceil(rawHeight);
-
-    log(
-      `container scrollHeight=${containerEl.scrollHeight}, participant scrollHeight=${participantScroll}, participant clientHeight=${participantClient}, participant overflow=${participantOverflow}, measured content=${contentHeight}`
-    );
-
+    const contentHeight = Math.ceil(containerEl.scrollHeight - participantClient + participantScroll);
+    log(`container=${containerEl.scrollHeight} list=${participantScroll}/${participantClient} content=${contentHeight}`);
     return contentHeight;
-  }, [containerRef, participantListRef, log]);
+  }, [log]);
 
   const scheduleContentMeasurement = useCallback(() => {
-    const runMeasurement = () => {
+    if (measurementFrame.current !== null) return;
+    measurementFrame.current = window.requestAnimationFrame(() => {
       measurementFrame.current = null;
-
       const contentHeight = measureContentHeight();
-      if (contentHeight == null) {
-        return;
-      }
+      if (contentHeight == null) return;
 
       const previousHeight = lastRequestedHeight.current;
-      if (
-        previousHeight !== null &&
-        Math.abs(contentHeight - previousHeight) <= HEIGHT_EPSILON
-      ) {
-        log(
-          `Skip setHeight – delta ${Math.abs(
-            contentHeight - previousHeight
-          )} <= ${HEIGHT_EPSILON}`
-        );
-        return;
-      }
+      if (previousHeight !== null && Math.abs(contentHeight - previousHeight) <= HEIGHT_EPSILON) return;
 
       lastRequestedHeight.current = contentHeight;
       OBR.action
         .setHeight(contentHeight)
-        .then(() => {
-          log(`Requested OBR panel height ${contentHeight}`);
-        })
-        .catch((error) => {
-          console.error("[Resize] Failed to set OBR panel height", error);
-        });
-    };
-
-    if (measurementFrame.current !== null) {
-      return;
-    }
-
-    if (typeof window !== "undefined") {
-      if (typeof window.requestAnimationFrame === "function") {
-        measurementFrame.current = window.requestAnimationFrame(runMeasurement);
-        return;
-      }
-
-      measurementFrame.current = window.setTimeout(runMeasurement, 0);
-      return;
-    }
-
-    runMeasurement();
+        .then(() => log(`Requested OBR panel height ${contentHeight}`))
+        .catch((error) => console.error("[Resize] Failed to set OBR panel height", error));
+    });
   }, [measureContentHeight, log]);
 
   const applyViewportConstraint = useCallback(() => {
-    const containerEl = containerRef.current;
-    if (!containerEl) {
-      return;
-    }
+    if (!containerRef.current) return;
 
-    const participantEl = participantListRef.current;
-    const viewportHeight = Math.round(window.innerHeight);
-
-    if (participantEl) {
-      // Only set max height when we have a scrollable list
+    if (participantListRef.current) {
+      // Only cap the height when there is a scrollable list.
+      const viewportHeight = Math.round(window.innerHeight);
       if (Math.abs(viewportHeight - lastViewportHeight.current) > HEIGHT_EPSILON) {
         setMaxHeight(viewportHeight);
         lastViewportHeight.current = viewportHeight;
-        log(`Applied viewport constraint ${viewportHeight}`);
       }
-    } else {
-      // No list, remove height constraint
+    } else if (lastViewportHeight.current !== 0) {
       setMaxHeight(undefined);
-      if (lastViewportHeight.current !== 0) {
-        lastViewportHeight.current = 0;
-        log(`Removed viewport constraint (no participant list)`);
-      }
+      lastViewportHeight.current = 0;
     }
 
     scheduleContentMeasurement();
-  }, [log, scheduleContentMeasurement]);
+  }, [scheduleContentMeasurement]);
 
-  // Trigger on Redux state changes
   useEffect(() => {
-    applyViewportConstraint();
-  }, [state, applyViewportConstraint]);
-
-  // Trigger on window resize (separate effect, different lifecycle)
-  useEffect(() => {
-    const handleResize = () => applyViewportConstraint();
-    window.addEventListener("resize", handleResize);
-    return () => window.removeEventListener("resize", handleResize);
+    window.addEventListener("resize", applyViewportConstraint);
+    return () => window.removeEventListener("resize", applyViewportConstraint);
   }, [applyViewportConstraint]);
 
   useEffect(() => {
-    const observerTarget = containerRef.current;
-    if (!observerTarget) {
-      scheduleContentMeasurement();
-      return;
-    }
+    const target = containerRef.current;
+    if (!target) return;
 
-    let resizeObserver: ResizeObserver | undefined;
-    let mutationObserver: MutationObserver | undefined;
-
-    // Set up ResizeObserver for dimension changes
-    if (typeof ResizeObserver !== "undefined") {
-      resizeObserver = new ResizeObserver(() => {
-        scheduleContentMeasurement();
-      });
-      resizeObserver.observe(observerTarget);
-    }
-
-    // Set up MutationObserver for content changes
-    if (typeof MutationObserver !== "undefined") {
-      mutationObserver = new MutationObserver(() => {
-        scheduleContentMeasurement();
-      });
-      mutationObserver.observe(observerTarget, {
-        childList: true,
-        subtree: true
-      });
-    }
-
-    scheduleContentMeasurement();
+    const onChange = () => applyViewportConstraint();
+    // ResizeObserver is in every browser OBR supports; jsdom (tests) lacks it.
+    const resizeObserver = typeof ResizeObserver === "undefined" ? undefined : new ResizeObserver(onChange);
+    resizeObserver?.observe(target);
+    const mutationObserver = new MutationObserver(onChange);
+    mutationObserver.observe(target, { childList: true, subtree: true });
+    applyViewportConstraint();
 
     return () => {
       resizeObserver?.disconnect();
-      mutationObserver?.disconnect();
+      mutationObserver.disconnect();
     };
-  }, [containerRef, scheduleContentMeasurement]);
+  }, [applyViewportConstraint]);
 
   useEffect(() => {
     return () => {
-      if (measurementFrame.current === null) {
-        return;
+      if (measurementFrame.current !== null) {
+        window.cancelAnimationFrame(measurementFrame.current);
+        measurementFrame.current = null;
       }
-
-      if (typeof window !== "undefined") {
-        if (typeof window.cancelAnimationFrame === "function") {
-          window.cancelAnimationFrame(measurementFrame.current);
-        } else {
-          window.clearTimeout(measurementFrame.current);
-        }
-      }
-
-      measurementFrame.current = null;
+      lastRequestedHeight.current = null;
+      OBR.action.setHeight(MANIFEST_HEIGHT).catch((error) => {
+        console.error("[Resize] Failed to reset OBR panel height", error);
+      });
     };
   }, []);
+
   return { containerRef, participantListRef, maxHeight };
 }

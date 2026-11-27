@@ -1,86 +1,57 @@
-// SWADE Initiative Tracker - State Migration System
+// SWADE Initiative Tracker - stored state migrations.
+// Migrations are pure: each takes the state at version v-1 and returns it at version v.
 
-import { EncounterState } from "./types";
+export const CURRENT_STATE_VERSION = 2;
 
-// Define the current schema version
-export const CURRENT_STATE_VERSION = 1;
+export type RawState = Record<string, unknown>;
+export type Migration = (state: RawState) => RawState;
 
-// Type for raw state data (could be any version)
-type RawStateData = Record<string, unknown>;
+export type MigrationResult =
+  | { kind: 'ok'; state: RawState }
+  | { kind: 'too-new' }
+  | { kind: 'invalid' };
 
-// Migration function signature with better type safety
-type MigrationFunction = (state: RawStateData) => RawStateData;
+const isRecord = (value: unknown): value is RawState =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
 
-// Define all migrations in order
-const MIGRATIONS: Record<number, MigrationFunction> = {
-  // Future migrations go here when needed for released versions
+/** v1 -> v2: drop the unused `tokenIds` and `drewThisRound` row fields; add `writerId`. */
+function migrateV1ToV2(state: RawState): RawState {
+  const rows = Array.isArray(state.rows)
+    ? state.rows.map((row) => {
+        if (!isRecord(row)) return row;
+        const { tokenIds: _tokenIds, drewThisRound: _drew, ...rest } = row;
+        return rest;
+      })
+    : state.rows;
+  return { ...state, rows, writerId: '' };
+}
+
+/** Migration that produces version N is stored under key N. */
+export const MIGRATIONS: Record<number, Migration> = {
+  2: migrateV1ToV2,
 };
 
 /**
- * Migrate state data from any old version to the current version
+ * Bring stored state of any known version to `target`. A missing version means v1
+ * (legacy). A version above `target` is `too-new`: the caller must not adopt or write it.
+ * The input is never mutated.
  */
-export function migrateState(rawState: RawStateData): EncounterState {
-  if (!rawState || typeof rawState !== 'object') {
-    throw new Error('Invalid state data for migration');
+export function migrateState(
+  raw: RawState,
+  migrations: Record<number, Migration> = MIGRATIONS,
+  target: number = CURRENT_STATE_VERSION
+): MigrationResult {
+  const version = raw.version === undefined ? 1 : raw.version;
+  if (typeof version !== 'number' || !Number.isInteger(version) || version < 1) {
+    return { kind: 'invalid' };
   }
+  if (version > target) return { kind: 'too-new' };
 
-  const currentState = { ...rawState };
-  const startVersion = (currentState.version as number) || 1;
-  
-  console.debug(`[MIGRATION] State version: ${startVersion}, target: ${CURRENT_STATE_VERSION}`);
-  
-  // Apply migrations in sequence from current version to target
-  for (let version = startVersion + 1; version <= CURRENT_STATE_VERSION; version++) {
-    const migration = MIGRATIONS[version];
-    if (migration) {
-      console.debug(`[MIGRATION] Applying migration to version ${version}`);
-      migration(currentState);
-    } else {
-      console.warn(`[MIGRATION] No migration defined for version ${version}`);
-    }
+  let state: RawState = structuredClone(raw);
+  for (let v = version + 1; v <= target; v++) {
+    const migration = migrations[v];
+    if (!migration) return { kind: 'invalid' };
+    state = migration(state);
   }
-  
-  // Ensure version is set correctly
-  (currentState as { version: number }).version = CURRENT_STATE_VERSION;
-  
-  // Ensure revision exists (for states created before revision support)
-  if (typeof (currentState as { revision?: number }).revision !== 'number') {
-    (currentState as { revision: number }).revision = 0;
-    console.debug('[MIGRATION] Added missing revision field');
-  }
-  
-  if (startVersion < CURRENT_STATE_VERSION) {
-    console.debug(`[MIGRATION] Successfully upgraded state from v${startVersion} to v${CURRENT_STATE_VERSION}`);
-  }
-  
-  return currentState as unknown as EncounterState;
-}
-
-/**
- * Validate that state has the minimum required structure
- */
-export function isValidStateStructure(rawState: unknown): rawState is RawStateData {
-  return (
-    typeof rawState === 'object' &&
-    rawState !== null &&
-    'round' in rawState &&
-    'phase' in rawState &&
-    'deck' in rawState &&
-    'rows' in rawState
-  );
-}
-
-/**
- * Check if state needs migration
- */
-export function needsMigration(rawState: RawStateData): boolean {
-  const version = (rawState?.version as number) || 1;
-  return version < CURRENT_STATE_VERSION;
-}
-
-/**
- * Get state version (defaults to 1 for legacy states)
- */
-export function getStateVersion(rawState: RawStateData): number {
-  return (rawState?.version as number) || 1;
+  return { kind: 'ok', state: { ...state, version: target } };
 }

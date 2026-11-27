@@ -1,8 +1,4 @@
-import { useEffect, useState } from "react";
-
 import { Stack } from "@mui/material";
-
-import OBR, { Player } from "@owlbear-rodeo/sdk";
 
 import { HeaderBar } from "./components/HeaderBar";
 import { ParticipantList } from "./components/ParticipantList";
@@ -12,26 +8,13 @@ import { InitiativeInactiveMessage } from "./components/InitiativeInactiveMessag
 import { PhaseReminder } from "./components/PhaseReminder";
 import { useAppSelector } from "./store/hooks";
 import { selectPhase } from "./store/selectors";
-import { useContextMenu } from "./hooks/useContextMenu";
 import { useObrPanelHeight } from "./hooks/useObrPanelHeight";
+import { useRole } from "./hooks/useRole";
 
+// Token context menus are registered by the background page (src/background.ts).
 export function InitiativeTracker() {
-  const [role, setRole] = useState<"GM" | "PLAYER">("PLAYER");
+  const role = useRole();
   const phase = useAppSelector(selectPhase);
-
-  // Setup context menus with undo integration
-  useContextMenu();
-
-  useEffect(() => {
-    const handlePlayerChange = (player: Player) => {
-      setRole(player.role);
-    };
-    OBR.player.getRole().then(setRole);
-    return OBR.player.onChange(handlePlayerChange);
-  }, []);
-
-  // State initialization is now handled by the OBR sync system automatically
-  // No need for manual initialization here - the sync system will load and initialize state
 
   const { containerRef, participantListRef, maxHeight } = useObrPanelHeight();
 

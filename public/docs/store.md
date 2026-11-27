@@ -33,20 +33,22 @@ This extension brings SWADE's unique card-based initiative system to your virtua
 ### Getting Started
 1. Open the Savage Worlds Initiative extension from your extensions panel
 2. Add combatants using the "Add Combatant" button or by right-clicking tokens on the map
-3. Click "Deal Cards" to start initiative and automatically sort combatants
+3. Click "Start Initiative" to deal cards and automatically sort combatants, then "Start Round"
 4. Use Previous/Next buttons to navigate through turns
 5. Click "End Round" when all combatants have acted
 
 ### Adding Combatants
 You can add combatants in two ways:
 - **From the extension**: Click "Add Combatant" and choose PC, NPC, or Extra
-- **From map tokens**: Right-click any token and select "Add as PC/NPC/Extra"
+- **From map tokens** (GM only): Right-click one or more tokens and select "Add as PC/NPC/Extra"
 
 ### Managing Initiative
 - **Hold Actions**: Active combatants can go on hold to act later in the round
 - **Act Now**: Held combatants can interrupt to act before or after the current turn
-- **Card Management**: Click on any card to draw replacements and choose which to keep
-- **NPC Privacy**: Toggle the eye icon to hide/show NPC cards from players
+- **Card Management** (GM only): Click on any card to draw replacements and choose which to keep
+- **NPC Privacy**: Toggle the eye icon to hide/show NPC cards from players. Hidden NPCs appear when their turn comes up. Privacy hides them in the tracker only; it is not a security feature.
+- **Undo**: The GM can undo the last action, as long as nobody else changed the tracker since
+- **Multiple GMs**: Changes made by two GMs at the same time are both kept
 
 ### GM Controls
 As a GM, you have full control over:

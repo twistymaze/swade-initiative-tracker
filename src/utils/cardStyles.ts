@@ -1,8 +1,7 @@
-import { cardsLookup } from "../store/selectors";
+import { CARDS } from "./cardIds";
 import { Theme } from "@mui/material/styles";
 
-// Generate base style object with theme awareness
-const getBaseStyle = () => ({
+const BASE_STYLE = {
   cursor: 'pointer',
   fontWeight: 'bold',
   minWidth: '50px',
@@ -17,34 +16,19 @@ const getBaseStyle = () => ({
     transform: 'none',
     opacity: 1
   }
-});
-
-export const getBaseCardStyle = (cardId: string, theme: Theme) => {
-  const card = cardsLookup[cardId];
-  const baseStyle = getBaseStyle();
-  
-  if (!card) return { 
-    color: 'black', 
-    bgcolor: 'white', 
-    border: `1px solid ${theme.palette.divider}`,
-    ...baseStyle
-  };
-  
-  if (card.rank === 'JOKER') {
-    return {
-      color: card.jokerColor === 'BLACK' ? 'black' : 'red',
-      bgcolor: 'white',
-      border: `1px solid ${theme.palette.divider}`,
-      ...baseStyle
-    };
-  }
-  
-  // Regular cards - red for hearts/diamonds, black for spades/clubs
-  const isRed = card.suit === 'H' || card.suit === 'D';
-  return {
-    color: isRed ? 'red' : 'black',
-    bgcolor: 'white',
-    border: `1px solid ${theme.palette.divider}`,
-    ...baseStyle
-  };
 };
+
+/** Text colour for a card: red for hearts, diamonds and the Red Joker; black otherwise */
+export const getCardColor = (cardId: string): 'red' | 'black' => {
+  const card = CARDS[cardId];
+  if (!card) return 'black';
+  if (card.rank === 'JOKER') return card.jokerColor === 'BLACK' ? 'black' : 'red';
+  return card.suit === 'H' || card.suit === 'D' ? 'red' : 'black';
+};
+
+export const getBaseCardStyle = (cardId: string, theme: Theme) => ({
+  color: getCardColor(cardId),
+  bgcolor: 'white',
+  border: `1px solid ${theme.palette.divider}`,
+  ...BASE_STYLE
+});

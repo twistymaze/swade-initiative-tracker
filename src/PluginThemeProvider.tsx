@@ -1,8 +1,7 @@
-import React from "react";
 import { Theme as MuiTheme, createTheme, ThemeProvider } from "@mui/material/styles";
 import { CssBaseline } from "@mui/material";
 import OBR, { Theme } from "@owlbear-rodeo/sdk";
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 
 /**
  * Create a MUI theme based off of the current OBR theme
@@ -44,14 +43,17 @@ function getTheme(theme?: Theme) {
 export function PluginThemeProvider({
   children,
 }: {
-  children?: React.ReactNode;
+  children?: ReactNode;
 }) {
   const [theme, setTheme] = useState<MuiTheme>(() => getTheme());
   useEffect(() => {
     const updateTheme = (theme: Theme) => {
       setTheme(getTheme(theme));
     };
-    OBR.theme.getTheme().then(updateTheme);
+    OBR.theme
+      .getTheme()
+      .then(updateTheme)
+      .catch((error) => console.error("[SWADE] Failed to read the OBR theme", error));
     return OBR.theme.onChange(updateTheme);
   }, []);
 

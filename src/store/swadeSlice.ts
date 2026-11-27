@@ -1,763 +1,609 @@
 // SWADE Redux Slice
+//
+// Rules kept by every reducer:
+// - The deck invariant: remaining + inPlay + discard always hold the 54 unique card ids.
+// - Validate first, mutate after: no reducer changes the draft and then returns early.
+// - Revision/writerId are stamped centrally (store.ts); reducers never touch them.
 import { createSlice, PayloadAction } from '@reduxjs/toolkit';
-import { EncounterState, CardId, ParticipantRow } from './types';
-import { initializeEmptyState } from './roomState';
-import { RED_JOKER_ID, BLACK_JOKER_ID } from '../utils/cardIds';
-
-import { getCardScore } from "../utils/cardScoring";
+import { EncounterState, CardId, ParticipantRow, ParticipantType } from './types';
+import { initializeEmptyState } from './initialState';
+import { isJokerId } from '../utils/cardIds';
+import { isSafeImageUrl } from './stateCodec';
+import { getCardScore } from '../utils/cardScoring';
+import { fisherYatesShuffle, hashString, randomSeed, seededRandom } from '../utils/shuffle';
 
 const initialState: EncounterState = initializeEmptyState();
 
-// Helper to log state snapshot
-const logState = (state: EncounterState) => {
-  const { deck, rows, turn, round, phase } = state;
-  const snapshot = {
-    round,
-    phase,
-    inPlay: deck.inPlay.length,
-    discarded: deck.discard.length,
-    remaining: deck.remaining.length,
-    reshuffleAfterRound: deck.reshuffleAfterRound,
-    participants: rows.map(row => ({
-      id: row.id,
-      name: row.name,
-      type: row.type,
-      card: row.currentCardId ?? null,
-      candidates: row.candidateIds,
-      inactive: row.inactive,
-      onHold: row.onHold,
-      revealed: row.revealed,
-    })),
-    turn,
-    deck: {
-      remaining: deck.remaining,
-      inPlay: deck.inPlay,
-      discard: deck.discard,
-    },
-    discard: deck.discard,
-  };
-  console.log('[STATE]', snapshot);
+// ---------- randomness ----------
+// Reducers are pure: the same state and action always give the same result, so a GM's action
+// replayed on another state (sync engine) deals the same cards when the deck is the same.
+// Actions that shuffle carry a seed in `meta`, made by their `prepare` callback at dispatch time.
+
+/** Meta of an action whose reducer may shuffle. */
+export interface SeedMeta {
+  seed: number;
+}
+
+type Random = () => number;
+
+/** Action creator input: an optional explicit seed (tests); otherwise a random one. */
+const seedMeta = (seed?: number): SeedMeta => ({ seed: seed ?? randomSeed() });
+
+/**
+ * The seed for one reducer call: the action's, or (an action without one, e.g. built by hand)
+ * a hash of the deck, so the result is still deterministic.
+ */
+const seedFor = (state: EncounterState, action: { type: string; meta?: unknown }): number => {
+  const meta = action.meta as Partial<SeedMeta> | undefined;
+  return typeof meta?.seed === 'number'
+    ? meta.seed
+    : hashString(`${action.type}|${state.deck.remaining.join(',')}|${state.deck.discard.join(',')}`);
 };
 
-// Helper to increment revision on state changes (for sync loop detection)
-const incrementRevision = (state: EncounterState) => {
-  const oldRevision = state.revision ?? 0;
-  state.revision = oldRevision + 1;
-  console.debug('[REVISION] Incremented from', oldRevision, 'to', state.revision);
-  logState(state);
+/** The PRNG for one reducer call (see seedFor). */
+const randomFor = (state: EncounterState, action: { type: string; meta?: unknown }): Random =>
+  seededRandom(seedFor(state, action));
+
+// ---------- turn helpers ----------
+
+/** An Extra (GROUP) marked incapacitated. It never acts, even on Hold or with a Joker. */
+export const isIncapacitatedExtra = (row: ParticipantRow): boolean => row.inactive && row.type === 'GROUP';
+
+/**
+ * The one turn rule, used by Start Round, Next, Previous and auto-reveal. A row has a turn
+ * this round when it is not held, is not an incapacitated Extra (inactive GROUP), and has a
+ * card or an Act Now turn (`actNowTurn`, a held-over row with no card). So a row that lost
+ * its turn (Lose Turn) or an Extra revived mid-round (never dealt in) has no turn.
+ */
+export const canTakeTurn = (row: ParticipantRow): boolean =>
+  !row.onHold && !isIncapacitatedExtra(row) && (row.currentCardId !== undefined || row.actNowTurn === true);
+
+/** Index of the first row at or after `fromIndex` that can take a turn, or -1. */
+export const findTurnIndexFrom = (rows: readonly ParticipantRow[], fromIndex: number): number => {
+  for (let i = Math.max(0, fromIndex); i < rows.length; i++) {
+    if (canTakeTurn(rows[i])) return i;
+  }
+  return -1;
 };
 
-// Helper for auto-revealing participants when they become active
-const autoRevealParticipant = (state: EncounterState, participantId: string | null) => {
-  if (participantId) {
-    const participant = state.rows.find(p => p.id === participantId);
-    if (participant && !participant.revealed) {
-      participant.revealed = true;
-      console.debug(`[SWADE] Auto-revealed ${participant.name} on activation`);
+const activeIndexOf = (state: EncounterState): number =>
+  state.turn.activeRowId ? state.rows.findIndex(r => r.id === state.turn.activeRowId) : -1;
+
+/** Reveal a row when it becomes active. Rows that cannot take a turn are never auto-revealed. */
+const autoReveal = (row: ParticipantRow | undefined) => {
+  if (row && canTakeTurn(row)) row.revealed = true;
+};
+
+/** Make the first eligible row at or after `fromIndex` active (or nobody). */
+const activateFrom = (state: EncounterState, fromIndex: number) => {
+  const index = findTurnIndexFrom(state.rows, fromIndex);
+  const row = index >= 0 ? state.rows[index] : undefined;
+  state.turn.activeRowId = row?.id ?? null;
+  autoReveal(row);
+};
+
+// ---------- deck helpers ----------
+
+/** Move the given cards from inPlay to discard (ids not in play are ignored). */
+const discardFromPlay = (state: EncounterState, ids: readonly CardId[]) => {
+  for (const id of ids) {
+    const index = state.deck.inPlay.indexOf(id);
+    if (index > -1) {
+      state.deck.inPlay.splice(index, 1);
+      state.deck.discard.push(id);
     }
   }
 };
 
-// Shared Fisher-Yates shuffle utility
-const fisherYatesShuffle = <T>(array: T[]) => {
-  for (let i = array.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [array[i], array[j]] = [array[j], array[i]];
-  }
+/** Shuffle the discard pile back into the remaining deck. */
+const reshuffleDiscardIntoDeck = (state: EncounterState, random: Random) => {
+  state.deck.remaining.push(...state.deck.discard);
+  state.deck.discard = [];
+  fisherYatesShuffle(state.deck.remaining, random);
 };
 
-// Helper function to deal a single card, handling reshuffle if needed
-const dealSingleCard = (state: EncounterState): CardId | null => {
-  // If no cards remaining, reshuffle discard pile
+/** Deal one card into play (reshuffling the discard pile if the deck is empty). */
+const dealSingleCard = (state: EncounterState, random: Random): CardId | null => {
   if (state.deck.remaining.length === 0) {
-    if (state.deck.discard.length === 0) {
-      console.error('[SWADE] Cannot deal card - no cards available in deck or discard');
-      return null;
-    }
-    
-    // Move discard back to remaining and shuffle
-    state.deck.remaining.push(...state.deck.discard);
-    state.deck.discard = [];
-    fisherYatesShuffle(state.deck.remaining);
-    console.debug('[SWADE] Auto-reshuffled deck (was empty)');
+    if (state.deck.discard.length === 0) return null;
+    reshuffleDiscardIntoDeck(state, random);
   }
-  
-  // Deal the card
   const cardId = state.deck.remaining.pop();
-  if (cardId) {
-    state.deck.inPlay.push(cardId);
-    
-    // Check for Jokers to set reshuffle flag
-    if (cardId === RED_JOKER_ID || cardId === BLACK_JOKER_ID) {
-      state.deck.reshuffleAfterRound = true;
-    }
-    
-    return cardId as CardId;
+  if (!cardId) return null;
+  state.deck.inPlay.push(cardId);
+  if (isJokerId(cardId)) {
+    state.deck.reshuffleAfterRound = true;
+    state.deck.jokersDealtThisRound = (state.deck.jokersDealtThisRound ?? 0) + 1;
   }
-  
-  return null;
+  return cardId;
 };
 
-// Shared sorting function for participants by SWADE initiative order
-const sortParticipantsByInitiative = (state: EncounterState) => {
-  state.rows.sort((a, b) => {
-    const scoreA = getCardScore(a.currentCardId);
-    const scoreB = getCardScore(b.currentCardId);
-    
-    // Helper function to get sort priority
-    const getSortPriority = (participant: ParticipantRow, score: number) => {
-      // Jokers always first (score 1000+)
-      if (score >= 1000) return 0;
-      // Held participants second
-      if (participant.onHold) return 1;
-      // Regular card holders third
-      if (score > -1) return 2;
-      // Non-card holders last
-      return 3;
-    };
-    
-    const priorityA = getSortPriority(a, scoreA);
-    const priorityB = getSortPriority(b, scoreB);
-    
-    // If different priorities, sort by priority
-    if (priorityA !== priorityB) {
-      return priorityA - priorityB;
-    }
-    
-    // Within same priority group, use specific sorting
-    if (priorityA === 0) {
-      // Both Jokers - sort by card score (Black > Red)
-      return scoreB - scoreA;
-    } else if (priorityA === 1) {
-      // Both held - sort by type then name
-      const typeOrder = { 'PC': 0, 'NPC': 1, 'GROUP': 2 };
-      const typeA = typeOrder[a.type];
-      const typeB = typeOrder[b.type];
-      
-      if (typeA !== typeB) {
-        return typeA - typeB;
-      }
-      return a.name.localeCompare(b.name);
-    } else if (priorityA === 2) {
-      // Both have cards - sort by card score
-      return scoreB - scoreA;
-    } else {
-      // Both no cards - sort by type then name
-      const typeOrder = { 'PC': 0, 'NPC': 1, 'GROUP': 2 };
-      const typeA = typeOrder[a.type];
-      const typeB = typeOrder[b.type];
-      
-      if (typeA !== typeB) {
-        return typeA - typeB;
-      }
-      return a.name.localeCompare(b.name);
-    }
-  });
+/** All cards a row holds (candidates plus keeper). */
+const rowCards = (row: ParticipantRow): CardId[] =>
+  row.currentCardId && !row.candidateIds.includes(row.currentCardId)
+    ? [...row.candidateIds, row.currentCardId]
+    : [...row.candidateIds];
+
+// ---------- ordering ----------
+
+const TYPE_ORDER: Record<ParticipantType, number> = { PC: 0, NPC: 1, GROUP: 2 };
+
+/** Sort key: Jokers, then held rows, then card holders (high to low), then rows without a card. */
+const sortKey = (row: ParticipantRow): [number, number, number, string] => {
+  const score = getCardScore(row.currentCardId);
+  const priority = score >= 1000 ? 0 : row.onHold ? 1 : score > -1 ? 2 : 3;
+  return [priority, -score, TYPE_ORDER[row.type], row.name];
 };
+
+const compareRows = (a: ParticipantRow, b: ParticipantRow): number => {
+  const ka = sortKey(a);
+  const kb = sortKey(b);
+  for (let i = 0; i < 3; i++) {
+    const d = (ka[i] as number) - (kb[i] as number);
+    if (d !== 0) return d;
+  }
+  return ka[3].localeCompare(kb[3]);
+};
+
+const sortRows = (state: EncounterState) => {
+  state.rows.sort(compareRows);
+};
+
+/**
+ * Insert `row` (not in the array) at its score position, but only among rows that
+ * have not acted yet (after the active row) while a round is running.
+ */
+const insertAmongPending = (state: EncounterState, row: ParticipantRow) => {
+  const start = state.phase === 'in_round' ? activeIndexOf(state) + 1 : 0;
+  let index = state.rows.length;
+  for (let i = start; i < state.rows.length; i++) {
+    if (compareRows(row, state.rows[i]) < 0) {
+      index = i;
+      break;
+    }
+  }
+  state.rows.splice(index, 0, row);
+};
+
+/**
+ * True when addCandidateCard would draw a card: cards are dealt (or a round runs), the row
+ * exists, and the deck or the discard pile has a card. The chooser's "+" uses the same rule.
+ */
+export const canAddCandidateCard = (state: EncounterState, participantId: string | null): boolean =>
+  (state.phase === 'cards_dealt' || state.phase === 'in_round') &&
+  state.rows.some(p => p.id === participantId) &&
+  state.deck.remaining.length + state.deck.discard.length > 0;
+
+/**
+ * Jokers dealt this round: the stored count, but never fewer than the Jokers in play or
+ * discarded since the last reshuffle (a state from an older writer may lack the count).
+ */
+const jokersDealtThisRound = (state: EncounterState): number =>
+  Math.max(
+    state.deck.jokersDealtThisRound ?? 0,
+    state.deck.inPlay.filter(isJokerId).length + state.deck.discard.filter(isJokerId).length,
+  );
 
 export const swadeSlice = createSlice({
   name: 'swade',
   initialState,
   reducers: {
-    // Card operations - candidate pattern
-    addCandidateCard: (state, action: PayloadAction<string>) => {
-      const participantId = action.payload;
-      const participant = state.rows.find(p => p.id === participantId);
-      if (!participant) {
-        console.warn('[SWADE] Cannot add candidate - participant not found');
-        return;
-      }
-      
-      const cardId = dealSingleCard(state);
-      if (cardId) {
-        participant.candidateIds.push(cardId);
-        
-        console.debug(`[SWADE] Added candidate ${cardId} to ${participant.name}`,
-          `(${participant.candidateIds.length} candidates)`);
-      } else {
-        console.error(`[SWADE] Failed to deal candidate card to ${participant.name}`);
-      }
-      incrementRevision(state);
+    // ---------- card chooser ----------
+
+    addCandidateCard: {
+      reducer: (state, action: PayloadAction<string, string, SeedMeta>) => {
+        if (!canAddCandidateCard(state, action.payload)) return;
+        const participant = state.rows.find(p => p.id === action.payload)!;
+        const cardId = dealSingleCard(state, randomFor(state, action));
+        if (cardId) participant.candidateIds.push(cardId);
+      },
+      prepare: (participantId: string, seed?: number) => ({ payload: participantId, meta: seedMeta(seed) }),
     },
 
-    selectKeeperCard: (state, action: PayloadAction<{participantId: string, cardId: string}>) => {
+    selectKeeperCard: (state, action: PayloadAction<{ participantId: string; cardId: string }>) => {
       const { participantId, cardId } = action.payload;
-      const participant = state.rows.find(p => p.id === participantId);
-      
-      if (!participant || !participant.candidateIds.includes(cardId)) {
-        console.error('[SWADE] Invalid keeper selection:', participantId, cardId);
-        return;
-      }
-      
-      // Discard non-kept candidates
-      participant.candidateIds.forEach(cid => {
-        if (cid !== cardId) {
-          const index = state.deck.inPlay.indexOf(cid);
-          if (index > -1) {
-            state.deck.inPlay.splice(index, 1);
-            state.deck.discard.push(cid);
-          }
-        }
-      });
-      
-      // Set keeper
+      const index = state.rows.findIndex(p => p.id === participantId);
+      const participant = state.rows[index];
+      if (!participant || !participant.candidateIds.includes(cardId)) return;
+      // Already the only card: nothing to change (no new revision, write or undo entry).
+      if (participant.currentCardId === cardId && participant.candidateIds.length === 1) return;
+
+      discardFromPlay(state, rowCards(participant).filter(id => id !== cardId));
       participant.currentCardId = cardId;
-      participant.candidateIds = [cardId]; // Keep only the selected card
-      
-      // Resort participants to reflect new initiative order
-      sortParticipantsByInitiative(state);
-      
-      console.log(`[SWADE Initiative] ${participant.name} kept ${cardId} - participants resorted`);
-      incrementRevision(state);
+      participant.candidateIds = [cardId];
+
+      const activeIndex = activeIndexOf(state);
+      if (state.phase !== 'in_round') {
+        sortRows(state);
+      } else if (activeIndex > -1 && index > activeIndex) {
+        // Not acted yet: re-place among the rows that still have to act.
+        state.rows.splice(index, 1);
+        insertAmongPending(state, participant);
+      }
+      // A row that has acted (or is acting) keeps its place; with nobody active, all have acted.
     },
 
-    clearParticipantCard: (state, action: PayloadAction<string>) => {
-      const participantId = action.payload;
-      const participant = state.rows.find(p => p.id === participantId);
+    /** Chooser Cancel: discard every candidate except the current keeper. */
+    discardExtraCandidates: (state, action: PayloadAction<string>) => {
+      const participant = state.rows.find(p => p.id === action.payload);
       if (!participant) return;
-      
-      // Move all candidate cards to discard
-      participant.candidateIds.forEach(cardId => {
-        const index = state.deck.inPlay.indexOf(cardId);
-        if (index > -1) {
-          state.deck.inPlay.splice(index, 1);
-          state.deck.discard.push(cardId);
-        }
-      });
-      
-      participant.currentCardId = undefined;
-      participant.candidateIds = [];
-      participant.drewThisRound = false;
-      
-      console.debug(`[SWADE] Cleared cards for ${participant.name}`);
-      incrementRevision(state);
+      const keep = participant.currentCardId;
+      const extras = participant.candidateIds.filter(id => id !== keep);
+      if (extras.length === 0) return;
+      discardFromPlay(state, extras);
+      participant.candidateIds = keep ? [keep] : [];
     },
 
     undoLastDraw: (state, action: PayloadAction<string>) => {
-      const participantId = action.payload;
-      const participant = state.rows.find(p => p.id === participantId);
-      if (!participant || participant.candidateIds.length === 0) return;
-      
-      // Remove the last drawn card (most recent)
-      const lastCardId = participant.candidateIds.pop();
-      if (lastCardId) {
-        // Move card from inPlay back to top of remaining deck
-        const inPlayIndex = state.deck.inPlay.indexOf(lastCardId);
-        if (inPlayIndex > -1) {
-          state.deck.inPlay.splice(inPlayIndex, 1);
-          state.deck.remaining.push(lastCardId); // Put back on top of deck
-        }
-        
-        console.debug(`[SWADE] Undid draw of ${lastCardId} for ${participant.name}`);
+      const participant = state.rows.find(p => p.id === action.payload);
+      if (!participant) return;
+      const lastCardId = participant.candidateIds[participant.candidateIds.length - 1];
+      const inPlayIndex = lastCardId ? state.deck.inPlay.indexOf(lastCardId) : -1;
+      // Never take back the keeper itself.
+      if (!lastCardId || lastCardId === participant.currentCardId || inPlayIndex === -1) return;
+
+      // Only taking back a Joker can clear the flag, and only when no other Joker deal is
+      // left this round (one may have gone back into the deck in a mid-round reshuffle).
+      if (isJokerId(lastCardId)) {
+        const left = jokersDealtThisRound(state) - 1;
+        state.deck.jokersDealtThisRound = left;
+        state.deck.reshuffleAfterRound = left > 0;
       }
-      
-      incrementRevision(state);
+      participant.candidateIds.pop();
+      state.deck.inPlay.splice(inPlayIndex, 1);
+      state.deck.remaining.push(lastCardId); // back on top of the deck
     },
 
+    // ---------- round flow ----------
 
-    discardCard: (state, action: PayloadAction<CardId>) => {
-      const cardId = action.payload;
-      const inPlayIndex = state.deck.inPlay.indexOf(cardId);
-      if (inPlayIndex > -1) {
-        state.deck.inPlay.splice(inPlayIndex, 1);
-        state.deck.discard.push(cardId);
-        console.debug('[SWADE] Discarded:', cardId, 
-          `(${state.deck.inPlay.length} in play, ${state.deck.discard.length} discarded)`);
-      } else {
-        console.warn('[SWADE] Card not found in play:', cardId);
-      }
-      incrementRevision(state);
-    },
+    /** Deal one card to each row that is not held and is not an inactive Extra. */
+    dealRound: {
+      reducer: (state, action: PayloadAction<undefined, string, SeedMeta>) => {
+        if (state.phase !== 'setup' && state.phase !== 'between_rounds') return;
+        if (state.rows.length === 0) return;
 
-    shuffleDeck: (state) => {
-      // Move all discard cards back to remaining
-      if (state.deck.discard.length > 0) {
-        state.deck.remaining.push(...state.deck.discard);
-        state.deck.discard = [];
-      }
-      
-      // Fisher-Yates shuffle of remaining cards
-      fisherYatesShuffle(state.deck.remaining);
-      
-      // Reset reshuffle flag
-      state.deck.reshuffleAfterRound = false;
-      
-      console.log('[SWADE Initiative] Deck shuffled:', state.deck.remaining.length, 'cards');
-      incrementRevision(state);
-    },
+        const random = randomFor(state, action);
+        for (const row of state.rows) {
+          if (state.settings.hideNpcFromPlayers && row.type !== 'PC') row.revealed = false;
+          if (row.onHold || (row.inactive && row.type === 'GROUP')) continue;
+          const cardId = dealSingleCard(state, random);
+          if (cardId) {
+            row.currentCardId = cardId;
+            row.candidateIds = [cardId];
+          }
+        }
 
-    // Deal round - draws one card per eligible participant
-    dealRound: (state) => {
-      // Count eligible participants (array version)
-      // Skip held participants and inactive Extras (GROUP), but deal to inactive PC/NPC (they need cards for incapacitation checks)
-      const eligibleParticipants = state.rows.filter(row => 
-        !row.onHold && !(row.inactive && row.type === 'GROUP')
-      );
-      
-      // No need to check card count - dealSingleCard handles reshuffling automatically
-      
-      // Clear previous round data (array version)
-      state.rows.forEach(row => {
-        row.candidateIds = [];
-        row.drewThisRound = false;
-        // Keep currentCardId for held participants
-        if (!row.onHold) {
-          row.currentCardId = undefined;
-        }
-        
-        // Re-hide NPCs if privacy is enabled
-        if (state.settings.hideNpcFromPlayers && row.type !== 'PC') {
-          row.revealed = false;
-        }
-      });
-      
-      let cardsDealt = 0;
-      
-      // Deal to eligible participants
-      eligibleParticipants.forEach(row => {
-        const cardId = dealSingleCard(state);
-        if (cardId) {
-          row.currentCardId = cardId;
-          row.candidateIds = [cardId];
-          row.drewThisRound = true;
-          cardsDealt++;
-          
-          console.debug(`[SWADE] Dealt ${cardId} to ${row.name}`);
-        } else {
-          console.error(`[SWADE] Failed to deal card to ${row.name} - no cards available`);
-        }
-      });
-      
-      // Now PHYSICALLY reorder the array by SWADE rules
-      if (cardsDealt > 0) {
-        sortParticipantsByInitiative(state);
-      }
-      
-      // Only advance round if we successfully dealt cards
-      if (cardsDealt > 0) {
-        const wasSetup = state.round === 0;
-        state.round = wasSetup ? 1 : state.round + 1;
+        sortRows(state);
+        state.round += 1;
         state.phase = 'cards_dealt';
-        
-        console.log(`[SWADE Initiative] ${wasSetup ? 'Started' : 'Advanced to'} Round ${state.round} (dealt ${cardsDealt} cards) and reordered array`);
-      } else {
-        console.error('[SWADE] Deal round failed - no cards were dealt');
-      }
-      
-      incrementRevision(state);
+      },
+      prepare: (seed?: number) => ({ payload: undefined, meta: seedMeta(seed) }),
     },
 
-    // Start the actual round after cards are dealt and any adjustments made
+    /** Begin the round: the first row that is not held becomes active. */
     startRound: (state) => {
-      if (state.phase !== 'cards_dealt') {
-        console.error('[SWADE] Cannot start round - not in cards_dealt phase');
-        return;
-      }
-      
+      if (state.phase !== 'cards_dealt') return;
       state.phase = 'in_round';
-      
-      // Auto-activate first participant in the sorted array (simplified navigation)
-      const firstParticipant = state.rows[0];
-      
-      if (firstParticipant) {
-        state.turn.activeRowId = firstParticipant.id;
-        autoRevealParticipant(state, firstParticipant.id);
-        console.log(`[SWADE Initiative] Started Round ${state.round} - activated ${firstParticipant.name} (first in initiative order)`);
-      } else {
-        console.log(`[SWADE Initiative] Started Round ${state.round} - no participants to activate`);
-      }
-      
-      incrementRevision(state);
+      activateFrom(state, 0);
     },
 
-    // Game state operations
-    endRound: (state) => {
-      const cardsDiscarded = state.deck.inPlay.length;
-      
-      // Move all cards from inPlay to discard
-      if (state.deck.inPlay.length > 0) {
+    endRound: {
+      reducer: (state, action: PayloadAction<undefined, string, SeedMeta>) => {
+        if (state.phase !== 'in_round') return;
+        const random = randomFor(state, action);
+
         state.deck.discard.push(...state.deck.inPlay);
         state.deck.inPlay = [];
-      }
-      
-      // Clear participant cards and per-round flags
-      state.rows.forEach(row => {
-        row.currentCardId = undefined;
-        row.candidateIds = [];
-        row.drewThisRound = false;
-      });
-      
-      // Clear active turn navigation
-      state.turn.activeRowId = null;
-      
-      // Handle reshuffle if needed
-      if (state.deck.reshuffleAfterRound) {
-        // Move all cards back to remaining and shuffle
-        if (state.deck.discard.length > 0) {
-          state.deck.remaining.push(...state.deck.discard);
-          state.deck.discard = [];
+        for (const row of state.rows) {
+          row.currentCardId = undefined;
+          row.candidateIds = [];
+          delete row.actNowTurn;
         }
-        
-        // Fisher-Yates shuffle
-        fisherYatesShuffle(state.deck.remaining);
-        
-        state.deck.reshuffleAfterRound = false;
-        console.log('[SWADE Initiative] Auto-reshuffled deck after Joker round');
-      }
-      
-      // Update game state
-      state.phase = 'between_rounds';
-      
-      console.log(`[SWADE Initiative] Round ${state.round} ended`,
-        `(${cardsDiscarded} cards discarded)`);
-      incrementRevision(state);
+        state.turn.activeRowId = null;
+        delete state.deck.jokersDealtThisRound;
+
+        if (state.deck.reshuffleAfterRound) {
+          reshuffleDiscardIntoDeck(state, random);
+          state.deck.reshuffleAfterRound = false;
+        }
+        state.phase = 'between_rounds';
+      },
+      prepare: (seed?: number) => ({ payload: undefined, meta: seedMeta(seed) }),
     },
 
-    // Participant management
-    createParticipant: (state, action: PayloadAction<{
-      name: string;
-      type: 'PC' | 'NPC' | 'GROUP';
-      tokenIds?: string[];
-      imageUrl?: string;
-    }>) => {
-      const { name, type, tokenIds = [], imageUrl } = action.payload;
-      const id = `p-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
-      
-      const newParticipant: ParticipantRow = {
-        id,
-        name,
-        tokenIds,
-        imageUrl,
-        type,
-        inactive: false,
-        onHold: false,
-        currentCardId: undefined,
-        candidateIds: [],
-        drewThisRound: false,
-        revealed: type === 'PC' // PCs always visible
-      };
-      
-      // Add to array
-      state.rows.push(newParticipant);
-      
-      // Handle late joiner - draw immediately if cards have been dealt
-      if (state.phase === 'cards_dealt' || state.phase === 'in_round') {
-        const cardId = dealSingleCard(state);
-        if (cardId) {
-          newParticipant.currentCardId = cardId;
-          newParticipant.candidateIds = [cardId];
-          newParticipant.drewThisRound = true;
-          
-          console.debug(`[SWADE] Late joiner ${name} drew ${cardId}`);
-        } else {
-          console.error(`[SWADE] Failed to deal card to late joiner ${name}`);
+    // ---------- participants ----------
+
+    createParticipant: {
+      reducer: (state, action: PayloadAction<{
+        id: string;
+        name: string;
+        type: ParticipantType;
+        imageUrl?: string;
+      }, string, Partial<SeedMeta>>) => {
+        const { id, name, type, imageUrl } = action.payload;
+        // Idempotent by row id: a request that is handled twice (modal fallback after a late
+        // "accepted") or replayed onto a state that already has the row adds nothing.
+        if (state.rows.some(p => p.id === id)) return;
+        const row: ParticipantRow = {
+          id,
+          name,
+          // Same rule as the stored form, so memory and room agree.
+          imageUrl: isSafeImageUrl(imageUrl) ? imageUrl : undefined,
+          type,
+          inactive: false,
+          onHold: false,
+          currentCardId: undefined,
+          candidateIds: [],
+          revealed: type === 'PC', // PCs always visible
+        };
+
+        // Late joiner: draws immediately if cards have been dealt.
+        if (state.phase === 'cards_dealt' || state.phase === 'in_round') {
+          const cardId = dealSingleCard(state, randomFor(state, action));
+          if (cardId) {
+            row.currentCardId = cardId;
+            row.candidateIds = [cardId];
+          }
         }
-      }
-      
-      // Sort participants after adding
-      sortParticipantsByInitiative(state);
-      
-      console.log(`[SWADE Initiative] Created participant: ${name} (${type}) - ID: ${id}`);
-      incrementRevision(state);
+
+        if (state.phase === 'in_round' && activeIndexOf(state) === -1) {
+          // Nobody is active: every listed row has acted (or is held). The newcomer is
+          // the only one still to act, so it goes last and takes the turn now.
+          state.rows.push(row);
+          activateFrom(state, state.rows.length - 1);
+        } else if (state.phase === 'in_round') {
+          insertAmongPending(state, row);
+        } else {
+          state.rows.push(row);
+          sortRows(state);
+        }
+      },
+      // Short random row id keeps the stored state small. The seed is for a late joiner's draw.
+      // (An action rebuilt without meta, e.g. from a modal message, still deals deterministically.)
+      prepare: (payload: { name: string; type: ParticipantType; imageUrl?: string }, seed?: number) => ({
+        payload: { ...payload, id: Math.random().toString(36).slice(2, 10) },
+        meta: seedMeta(seed) as Partial<SeedMeta>,
+      }),
     },
 
     removeParticipant: (state, action: PayloadAction<string>) => {
-      const id = action.payload;
-      const participantIndex = state.rows.findIndex(p => p.id === id);
-      if (participantIndex === -1) {
-        console.warn('[SWADE] Participant not found for removal:', id);
-        return;
+      const index = state.rows.findIndex(p => p.id === action.payload);
+      if (index === -1) return;
+      const wasActive = state.turn.activeRowId === action.payload;
+
+      discardFromPlay(state, rowCards(state.rows[index]));
+      state.rows.splice(index, 1);
+
+      // The next row that has not acted takes over (no wrap to the top).
+      if (wasActive) {
+        if (state.phase === 'in_round') activateFrom(state, index);
+        else state.turn.activeRowId = null;
       }
-      
-      const participant = state.rows[participantIndex];
-      
-      // Discard any cards they have
-      [...participant.candidateIds].forEach(cardId => {
-        const index = state.deck.inPlay.indexOf(cardId);
-        if (index > -1) {
-          state.deck.inPlay.splice(index, 1);
-          state.deck.discard.push(cardId);
-        }
-      });
-      
-      // Remove from array
-      state.rows.splice(participantIndex, 1);
-      
-      // Clear active turn if needed
-      if (state.turn.activeRowId === id) {
-        state.turn.activeRowId = null;
-      }
-      
-      console.log(`[SWADE Initiative] Removed participant: ${participant.name}`);
-      incrementRevision(state);
     },
 
     removeAllNpcsAndExtras: (state) => {
-      const participantsToRemove = state.rows.filter(p => p.type === 'NPC' || p.type === 'GROUP');
-      
-      // Discard all cards from participants being removed
-      participantsToRemove.forEach(participant => {
-        [...participant.candidateIds].forEach(cardId => {
-          const index = state.deck.inPlay.indexOf(cardId);
-          if (index > -1) {
-            state.deck.inPlay.splice(index, 1);
-            state.deck.discard.push(cardId);
-          }
-        });
-      });
-      
-      // Remove all NPCs and Extras (GROUP type)
-      state.rows = state.rows.filter(p => p.type === 'PC');
-      
-      // Clear active turn if it was on a removed participant
-      if (state.turn.activeRowId && !state.rows.find(p => p.id === state.turn.activeRowId)) {
-        state.turn.activeRowId = null;
+      if (!state.rows.some(p => p.type !== 'PC')) return;
+      const oldActiveIndex = activeIndexOf(state);
+      const activeRemoved = oldActiveIndex > -1 && state.rows[oldActiveIndex].type !== 'PC';
+      // Survivors before the old active row = index where the next survivor lands.
+      const nextIndex = state.rows.slice(0, Math.max(oldActiveIndex, 0)).filter(p => p.type === 'PC').length;
+
+      for (const row of state.rows) {
+        if (row.type !== 'PC') discardFromPlay(state, rowCards(row));
       }
-      
-      console.log(`[SWADE Initiative] Removed ${participantsToRemove.length} NPCs/Extras`);
-      incrementRevision(state);
+      state.rows = state.rows.filter(p => p.type === 'PC');
+
+      if (activeRemoved) {
+        if (state.phase === 'in_round') activateFrom(state, nextIndex);
+        else state.turn.activeRowId = null;
+      }
     },
 
-    // Status setters (explicit, not toggles)
-    setHold: (state, action: PayloadAction<{id: string, value: boolean}>) => {
-      const { id, value } = action.payload;
-      const participant = state.rows.find(p => p.id === id);
+    // ---------- status setters (explicit values, not toggles) ----------
+
+    setHold: (state, action: PayloadAction<{ id: string; value: boolean }>) => {
+      const participant = state.rows.find(p => p.id === action.payload.id);
       if (!participant) return;
-      
-      participant.onHold = value;
-      console.log(`[SWADE Initiative] ${participant.name} hold: ${value}`);
-      incrementRevision(state);
+      // An incapacitated Extra cannot act, so it cannot go on Hold (an existing hold may be cleared).
+      if (action.payload.value && isIncapacitatedExtra(participant)) return;
+      participant.onHold = action.payload.value;
     },
 
-    setInactive: (state, action: PayloadAction<{id: string, value: boolean}>) => {
-      const { id, value } = action.payload;
-      const participant = state.rows.find(p => p.id === id);
-      if (!participant) return;
-      
-      participant.inactive = value;
-      console.log(`[SWADE Initiative] ${participant.name} inactive: ${value}`);
-      incrementRevision(state);
+    setInactive: (state, action: PayloadAction<{ id: string; value: boolean }>) => {
+      const participant = state.rows.find(p => p.id === action.payload.id);
+      if (participant) participant.inactive = action.payload.value;
     },
 
-    setRevealed: (state, action: PayloadAction<{id: string, value: boolean}>) => {
-      const { id, value } = action.payload;
-      const participant = state.rows.find(p => p.id === id);
-      if (!participant) return;
-      
-      participant.revealed = value;
-      console.debug(`[SWADE] ${participant.name} revealed: ${value}`);
-      incrementRevision(state);
+    setRevealed: (state, action: PayloadAction<{ id: string; value: boolean }>) => {
+      const participant = state.rows.find(p => p.id === action.payload.id);
+      if (participant) participant.revealed = action.payload.value;
     },
 
-    setParticipantType: (state, action: PayloadAction<{id: string, type: 'PC' | 'NPC' | 'GROUP'}>) => {
+    setParticipantType: (state, action: PayloadAction<{ id: string; type: ParticipantType }>) => {
       const { id, type } = action.payload;
       const participant = state.rows.find(p => p.id === id);
       if (!participant) return;
-      
       participant.type = type;
-      console.log(`[SWADE Initiative] ${participant.name} type changed to: ${type}`);
-      incrementRevision(state);
-    },
-    
-    renameParticipant: (state, action: PayloadAction<{id: string, name: string}>) => {
-      const { id, name } = action.payload;
-      const participant = state.rows.find(p => p.id === id);
-      if (!participant) return;
-      
-      const trimmedName = name.trim();
-      if (trimmedName) {
-        participant.name = trimmedName;
-        console.log(`[SWADE Initiative] Renamed participant to: ${trimmedName}`);
-        incrementRevision(state);
-      }
+      // PCs are always visible. Other changes keep the flag: a row players have already
+      // seen is only hidden again on deal / End Initiative.
+      if (type === 'PC') participant.revealed = true;
     },
 
-    // Lose hold due to Shaken/Stunned - clears hold and stays in place
+    renameParticipant: (state, action: PayloadAction<{ id: string; name: string }>) => {
+      const participant = state.rows.find(p => p.id === action.payload.id);
+      const name = action.payload.name.trim();
+      if (participant && name) participant.name = name;
+    },
+
+    /**
+     * Lose Turn (Shaken/Stunned while on Hold): clears hold and discards the card.
+     * During a round the row moves directly above the active row, so it does not act.
+     */
     loseHold: (state, action: PayloadAction<string>) => {
-      const id = action.payload;
-      const participant = state.rows.find(p => p.id === id);
-      if (!participant) return;
-      
-      // Clear hold status and current card - participant stays in same position
+      const index = state.rows.findIndex(p => p.id === action.payload);
+      if (index === -1) return;
+      const participant = state.rows[index];
+      // Nothing to lose: no hold, no card and no Act Now turn (the row has no turn anyway).
+      if (!participant.onHold && rowCards(participant).length === 0 && !participant.actNowTurn) return;
+
+      discardFromPlay(state, rowCards(participant));
       participant.onHold = false;
       participant.currentCardId = undefined;
       participant.candidateIds = [];
-      
-      // Don't move them! They just lose their turn where they are.
-      // Navigation will handle skipping them since they no longer have onHold=true
-      
-      console.log(`[SWADE Initiative] ${participant.name} lost hold (Shaken/Stunned) - staying in position`);
-      incrementRevision(state);
+      delete participant.actNowTurn;
+
+      if (state.phase === 'in_round') {
+        const activeIndex = activeIndexOf(state);
+        if (activeIndex > -1 && activeIndex !== index) {
+          state.rows.splice(index, 1);
+          state.rows.splice(activeIndexOf(state), 0, participant);
+        }
+      } else if (state.phase === 'cards_dealt') {
+        sortRows(state);
+      }
     },
 
-    // Turn management
+    // ---------- turn management ----------
+
+    /** Next / Previous. Only during a round: no row is active in any other phase. */
     setActiveParticipant: (state, action: PayloadAction<string | null>) => {
+      if (state.phase !== 'in_round') return;
       const id = action.payload;
+      const row = id ? state.rows.find(p => p.id === id) : undefined;
+      if (id && !row) return;
       state.turn.activeRowId = id;
-      
-      // Auto-reveal if setting active on hidden participant
-      autoRevealParticipant(state, id);
-      
-      const activeParticipant = id ? state.rows.find(p => p.id === id) : null;
-      console.debug(`[SWADE] Active participant: ${activeParticipant?.name || 'none'}`);
-      incrementRevision(state);
+      autoReveal(row);
     },
 
-    // Act Now - physically move participant in array
-    insertActNow: (state, action: PayloadAction<{id: string, placement: 'before' | 'after'}>) => {
+    /**
+     * Act Now: move the row before (interrupt) or after the active row; clears hold and reveals.
+     * In a round with nobody active (everyone else has acted) the row goes last and takes the turn.
+     */
+    insertActNow: (state, action: PayloadAction<{ id: string; placement: 'before' | 'after' }>) => {
       const { id, placement } = action.payload;
-      const participantIndex = state.rows.findIndex(p => p.id === id);
-      if (participantIndex === -1) return;
-      
-      const participant = state.rows[participantIndex];
-      
-      // Clear hold
+      const index = state.rows.findIndex(p => p.id === id);
+      if (index === -1) return;
+      // An incapacitated Extra cannot act; its hold (if any) stays for when it is revived.
+      if (isIncapacitatedExtra(state.rows[index])) return;
+      const currentActive = activeIndexOf(state);
+      const nobodyActive = state.phase === 'in_round' && currentActive === -1;
+      if (!nobodyActive && (currentActive === -1 || state.turn.activeRowId === id)) return;
+      // Already acting right after the active row: nothing to change.
+      const row = state.rows[index];
+      if (
+        !nobodyActive &&
+        placement === 'after' &&
+        index === currentActive + 1 &&
+        !row.onHold &&
+        row.revealed &&
+        row.currentCardId !== undefined
+      ) {
+        return;
+      }
+
+      const [participant] = state.rows.splice(index, 1);
       participant.onHold = false;
-      
-      // Find the active participant's position
-      const activeId = state.turn.activeRowId;
-      if (!activeId) {
-        console.warn('[SWADE] No active participant to insert relative to');
-        return;
-      }
-      
-      const activeIndex = state.rows.findIndex(p => p.id === activeId);
-      if (activeIndex === -1) {
-        console.warn('[SWADE] Active participant not found in array');
-        return;
-      }
-      
-      // Remove participant from current position
-      state.rows.splice(participantIndex, 1);
-      
-      // Calculate insertion position (adjust for removal if needed)
-      let insertIndex = activeIndex;
-      if (participantIndex < activeIndex) {
-        insertIndex--; // Adjust because we removed an item before the active participant
-      }
-      
-      // Insert before or after active participant
-      if (placement === 'before') {
-        state.rows.splice(insertIndex, 0, participant);
-      } else {
-        state.rows.splice(insertIndex + 1, 0, participant);
-      }
-      
-      // Handle active participant based on placement:
-      // - "before": interrupting, so they become active
-      // - "after": waiting until later, so current participant stays active
-      if (placement === 'before') {
-        state.turn.activeRowId = id;
-      }
-      // If placement === 'after', keep the original active participant
-      
-      // Always reveal participant when they act now (regardless of placement)
-      autoRevealParticipant(state, id);
-      
-      console.log(`[SWADE Initiative] ${participant.name} acting now (${placement}) - moved in array`);
-      incrementRevision(state);
+      participant.revealed = true;
+      // A held-over row has no card; this flag gives it its turn (see canTakeTurn).
+      if (participant.currentCardId === undefined) participant.actNowTurn = true;
+      const activeIndex = activeIndexOf(state); // after the removal
+      const target = nobodyActive ? state.rows.length : placement === 'before' ? activeIndex : activeIndex + 1;
+      state.rows.splice(target, 0, participant);
+      if (nobodyActive || placement === 'before') state.turn.activeRowId = id;
     },
 
-    // Settings
+    // ---------- settings ----------
+
     setPrivacy: (state, action: PayloadAction<boolean>) => {
       state.settings.hideNpcFromPlayers = action.payload;
-      console.log(`[SWADE Initiative] Privacy: ${action.payload ? 'enabled' : 'disabled'}`);
-      incrementRevision(state);
     },
 
-    // System operations
-    endInitiative: (state) => {
-      // Keep participants but clear their card states and reset privacy
-      state.rows.forEach(participant => {
-        participant.currentCardId = undefined;
-        participant.candidateIds = [];
-        participant.drewThisRound = false;
-        participant.onHold = false;
-        
-        // Reset revealed status based on privacy mode
-        if (state.settings.hideNpcFromPlayers && (participant.type === 'NPC' || participant.type === 'GROUP')) {
-          participant.revealed = false;
+    // ---------- system ----------
+
+    /** Keep rows; clear cards and holds; full fresh deck; back to setup. */
+    endInitiative: {
+      reducer: (state, action: PayloadAction<undefined, string, SeedMeta>) => {
+        // Already a fresh setup: do not reshuffle (no new revision, write or undo entry).
+        const fresh =
+          state.phase === 'setup' &&
+          state.round === 0 &&
+          state.turn.activeRowId === null &&
+          state.deck.inPlay.length === 0 &&
+          state.deck.discard.length === 0 &&
+          !state.deck.reshuffleAfterRound &&
+          state.deck.jokersDealtThisRound === undefined &&
+          state.rows.every(
+            (row) =>
+              !row.onHold &&
+              !row.actNowTurn &&
+              row.currentCardId === undefined &&
+              row.candidateIds.length === 0 &&
+              !(state.settings.hideNpcFromPlayers && row.type !== 'PC' && row.revealed),
+          );
+        if (fresh) return;
+        for (const row of state.rows) {
+          row.currentCardId = undefined;
+          row.candidateIds = [];
+          row.onHold = false;
+          delete row.actNowTurn;
+          if (state.settings.hideNpcFromPlayers && row.type !== 'PC') row.revealed = false;
         }
-      });
-      
-      // Reset deck to fresh shuffled state
-      const allCardIds = state.deck.remaining.concat(state.deck.inPlay, state.deck.discard);
-      const shuffled = [...allCardIds];
-      fisherYatesShuffle(shuffled);
-      
-      state.deck = {
-        remaining: shuffled,
-        inPlay: [],
-        discard: [],
-        reshuffleAfterRound: false
-      };
-      
-      // Reset round and phase
-      state.round = 0;
-      state.phase = 'setup';
-      
-      // Clear active participant
-      state.turn.activeRowId = null;
-      
-      console.log('[SWADE Initiative] Initiative ended - participants kept, deck/round reset');
-      incrementRevision(state);
+        state.deck = {
+          remaining: fisherYatesShuffle(
+            [...state.deck.remaining, ...state.deck.inPlay, ...state.deck.discard],
+            randomFor(state, action),
+          ),
+          inPlay: [],
+          discard: [],
+          reshuffleAfterRound: false,
+        };
+        state.round = 0;
+        state.phase = 'setup';
+        state.turn.activeRowId = null;
+      },
+      prepare: (seed?: number) => ({ payload: undefined, meta: seedMeta(seed) }),
     },
 
-    reset: () => {
-      console.log('[SWADE Initiative] State reset to initial');
-      return initializeEmptyState();
+    reset: {
+      reducer: (state, action: PayloadAction<undefined, string, SeedMeta>) =>
+        initializeEmptyState(seedFor(state, action)),
+      prepare: (seed?: number) => ({ payload: undefined, meta: seedMeta(seed) }),
     },
 
-    setEncounterState: (_state, action: PayloadAction<EncounterState>) => {
-      console.debug('[SWADE] State synced from OBR room metadata');
-      logState(action.payload);
-      return action.payload;
-    },
+    // Sync-only: replaces the state with one adopted from (or written to) the room.
+    // Not stamped with a new revision (see createAppStore).
+    setEncounterState: (_state, action: PayloadAction<EncounterState>) => action.payload,
 
-    // Note: Revision increments are now handled within each state-changing reducer
-  }
+    // Undo/redo: replaces the encounter content with a snapshot. A normal action,
+    // so the store wrapper stamps a new revision/writerId.
+    restoreSnapshot: (_state, action: PayloadAction<EncounterState>) => action.payload,
+  },
 });
 
-// Export actions
 export const {
-  // Card operations
   addCandidateCard,
   selectKeeperCard,
-  clearParticipantCard,
+  discardExtraCandidates,
   undoLastDraw,
-  discardCard,
-  shuffleDeck,
-  
-  // Round management
   dealRound,
   startRound,
   endRound,
-  
-  // Participant management
   createParticipant,
   removeParticipant,
   removeAllNpcsAndExtras,
-  
-  // Status setters
   setHold,
   loseHold,
   setInactive,
   setRevealed,
   setParticipantType,
   renameParticipant,
-  
-  // Turn management
   setActiveParticipant,
   insertActNow,
-  
-  // Settings
   setPrivacy,
-  
-  // System
   endInitiative,
   reset,
-  setEncounterState
+  setEncounterState,
+  restoreSnapshot,
 } = swadeSlice.actions;
 
-// Export reducer
 export default swadeSlice.reducer;
