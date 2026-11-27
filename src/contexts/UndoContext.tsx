@@ -1,82 +1,57 @@
 // Undo Context Provider
-// Provides undo functionality through React context with localStorage persistence
+// Exposes this iframe's LocalUndoStore (see src/store/localUndoStore.ts) to React.
 
-import { useState, useEffect, useMemo, useCallback, useSyncExternalStore, ReactNode } from 'react';
+import { useState, useEffect, useMemo, useCallback, useSyncExternalStore, type ReactNode } from 'react';
 import OBR from '@owlbear-rodeo/sdk';
-import { store } from '../store/store';
-import { setEncounterState } from '../store/swadeSlice';
+import { store, syncEngine, writerId } from '../store/store';
 import { LocalUndoStore } from '../store/localUndoStore';
-import { UndoContext, UndoContextValue } from './UndoContextDefinition';
+import { UndoContext, type UndoContextValue } from './UndoContextDefinition';
 
 interface UndoProviderProps {
   children: ReactNode;
+  /** For tests: use this store instead of one bound to this iframe's Redux store. */
+  undoStore?: LocalUndoStore;
 }
 
-export function UndoProvider({ children }: UndoProviderProps) {
-  const [undoStore] = useState(() => new LocalUndoStore());
+function createIframeUndoStore(): LocalUndoStore {
+  return new LocalUndoStore({
+    store,
+    writerId,
+    roomId: OBR.room.id,
+    getRoomIdentity: () => syncEngine.getRoomIdentity(),
+  });
+}
 
-  // Subscribe React to the undo store as an external mutable source. This keeps
-  // undo availability in sync without calling setState inside an effect.
-  const subscribe = useCallback(
-    (onChange: () => void) => undoStore.subscribe(onChange),
+export function UndoProvider({ children, undoStore: injected }: UndoProviderProps) {
+  const [undoStore] = useState(() => injected ?? createIframeUndoStore());
+
+  useEffect(() => {
+    undoStore.start();
+    return () => undoStore.destroy();
+  }, [undoStore]);
+
+  const subscribe = useCallback((onChange: () => void) => undoStore.subscribe(onChange), [undoStore]);
+  const canUndo = useSyncExternalStore(subscribe, () => undoStore.canUndo());
+  const undoDescription = useSyncExternalStore(subscribe, () => undoStore.getUndoDescription());
+
+  const performUndo = useCallback(() => {
+    undoStore.performUndo();
+  }, [undoStore]);
+
+  const captureCheckpoint = useCallback(
+    (description: string) => undoStore.captureCheckpoint(description),
     [undoStore]
   );
-  const canUndoState = useSyncExternalStore(subscribe, () => undoStore.canUndo());
-  const undoDescription = useSyncExternalStore(subscribe, () =>
-    undoStore.getUndoDescription()
+
+  const clearUndoHistory = useCallback(() => undoStore.clearCheckpoints(), [undoStore]);
+  const discardOwnCheckpoint = useCallback(() => {
+    undoStore.discardOwnTopCheckpoint();
+  }, [undoStore]);
+
+  const value = useMemo<UndoContextValue>(
+    () => ({ canUndo, undoDescription, performUndo, captureCheckpoint, clearUndoHistory, discardOwnCheckpoint }),
+    [canUndo, undoDescription, performUndo, captureCheckpoint, clearUndoHistory, discardOwnCheckpoint]
   );
 
-  // Initialize room storage on mount (OBR guaranteed ready by PluginGate) and
-  // tear down timers/subscribers on unmount. initializeWithRoom emits a change,
-  // so the subscriptions above pick up any loaded checkpoints.
-  useEffect(() => {
-    undoStore.initializeWithRoom(OBR.room.id);
-    return () => {
-      undoStore.destroy();
-    };
-  }, [undoStore]);
-
-  // Memoize functions to prevent unnecessary re-renders
-  const performUndo = useCallback(() => {
-    const currentState = store.getState().swade;
-    const undoState = undoStore.getUndoState(currentState.revision);
-    
-    if (undoState) {
-      // Dispatch the restored state with updated revision
-      // This will trigger OBR sync to other iframes
-      store.dispatch(setEncounterState(undoState));
-      console.debug('[Undo] Restored previous state');
-    } else {
-      console.debug('[Undo] No state to restore');
-    }
-  }, [undoStore]);
-
-  const captureCheckpoint = useCallback((description: string) => {
-    const currentState = store.getState().swade;
-    undoStore.captureCheckpoint(currentState, description);
-  }, [undoStore]);
-
-  const clearUndoHistory = useCallback(() => {
-    undoStore.clearCheckpoints();
-  }, [undoStore]);
-
-  const getCheckpointCount = useCallback(() => {
-    return undoStore.getCheckpointCount();
-  }, [undoStore]);
-
-  const value = useMemo<UndoContextValue>(() => ({
-    canUndo: canUndoState,
-    undoDescription,
-    performUndo,
-    captureCheckpoint,
-    clearUndoHistory,
-    getCheckpointCount
-  }), [canUndoState, undoDescription, performUndo, captureCheckpoint, clearUndoHistory, getCheckpointCount]);
-
-  return (
-    <UndoContext.Provider value={value}>
-      {children}
-    </UndoContext.Provider>
-  );
+  return <UndoContext.Provider value={value}>{children}</UndoContext.Provider>;
 }
-

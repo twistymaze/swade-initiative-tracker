@@ -7,30 +7,22 @@ import { useUndo } from '../hooks/useUndo';
 
 export function UndoButton() {
   const { canUndo, undoDescription, performUndo } = useUndo();
-  
-  const handleClick = () => {
-    if (canUndo) {
-      performUndo();
-    }
-  };
-  
-  // Build tooltip text
-  const tooltipTitle = canUndo && undoDescription
-    ? `Undo: ${undoDescription}`
-    : canUndo 
-      ? 'Undo last action'
-      : 'Nothing to undo';
-  
+
+  const tooltipTitle = !canUndo
+    ? 'Nothing to undo'
+    : undoDescription
+      ? `Undo: ${undoDescription}`
+      : 'Undo last action';
+
   return (
-    <Tooltip title={tooltipTitle}>
+    <Tooltip disableInteractive title={tooltipTitle}>
       <span>
-        <IconButton 
-          onClick={handleClick}
+        <IconButton
+          aria-label="Undo"
+          onClick={performUndo}
           disabled={!canUndo}
           size="small"
-          sx={{ 
-            color: canUndo ? 'text.primary' : 'text.disabled'
-          }}
+          sx={{ color: canUndo ? 'text.primary' : 'text.disabled' }}
         >
           <UndoIcon fontSize="small" />
         </IconButton>

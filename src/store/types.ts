@@ -13,22 +13,24 @@ export interface Card {
   label: string;         // e.g., 'A♠', '10♦', 'Red Joker', 'Black Joker'
 }
 
-// Note: getCardId function moved to src/utils/cardIds.ts
-
 export interface Deck {
   remaining: CardId[];    // top of deck is end of array (pop)
   inPlay: CardId[];       // cards currently assigned to participants
   discard: CardId[];
   reshuffleAfterRound: boolean; // true if any Joker appeared this round
+  /**
+   * Joker deals this round, net of Undo Last Draw (a Joker reshuffled mid-round and dealt
+   * again counts twice). Optional: absent in states from older writers (treated as 0).
+   */
+  jokersDealtThisRound?: number;
 }
 
 export type ParticipantType = 'PC' | 'NPC' | 'GROUP';
 
 export interface ParticipantRow {
-  id: string;                 // row id (distinct from OBR item id)
+  id: string;                 // short row id (distinct from OBR item id)
   name: string;               // display name
-  tokenIds: string[];         // OBR item ids represented by this row (image items preferred)
-  imageUrl?: string;          // URL of token image for avatar display
+  imageUrl?: string;          // https URL of token image for avatar display
   type: ParticipantType;
   inactive: boolean;
   onHold: boolean;            // carryover hold into subsequent rounds
@@ -37,7 +39,12 @@ export interface ParticipantRow {
   // Cards for the current round
   currentCardId?: CardId;     // keeper for this round (optional if holding into new round)
   candidateIds: CardId[];     // drawn this round (includes current if already chosen)
-  drewThisRound: boolean;     // for late joiners / skipping duplicates
+  /**
+   * True when the row has a turn this round from Act Now but no card (it was held over
+   * from an earlier round). Optional: omitted when false; cleared at End Round, End
+   * Initiative and Lose Turn.
+   */
+  actNowTurn?: boolean;
 }
 
 export interface Settings {
@@ -46,20 +53,24 @@ export interface Settings {
 
 export type Phase = 'setup' | 'between_rounds' | 'cards_dealt' | 'in_round';
 
+/** Identifies one state: the writer's iframe id and the revision it stamped. */
+export interface StateIdentity {
+  revision: number;
+  writerId: string;
+}
+
 export interface EncounterState {
-  version: 1;
+  version: 2;
   round: number;               // 0 before first deal; increments each Deal Round
-  phase: Phase;                // 'setup' before first round; 'between_rounds' after End Round; 'in_round' during a round
+  phase: Phase;
   deck: Deck;
-  rows: ParticipantRow[];      // Array in display order (no more dynamic sorting)
+  rows: ParticipantRow[];      // array in display order
   turn: {
     activeRowId: string | null;
   };
   settings: Settings;
-  revision: number;           // Increments with each state change, for sync loop detection
-}
-
-// Local component state (NOT synced in metadata)
-export interface LocalComponentState {
-  undoStack: EncounterState[]; // Local undo history (max 10-20)
+  /** Stamped centrally (store.ts) on every local change; with writerId it identifies a state. */
+  revision: number;
+  /** Id of the iframe that made the last change ("" for migrated or fresh states). */
+  writerId: string;
 }

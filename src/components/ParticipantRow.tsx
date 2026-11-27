@@ -1,247 +1,224 @@
-import React, { useEffect, useRef, useState, useCallback } from "react";
-import { 
-  ListItem,
-  Box,
-  Typography,
-  useTheme,
-  Tooltip,
-  IconButton,
-  Menu,
-  MenuItem,
-  ListItemIcon,
-  Divider,
-  TextField
-} from "@mui/material";
-import DeleteIcon from '@mui/icons-material/Delete';
-import MoreVertIcon from '@mui/icons-material/MoreVert';
-import CheckIcon from '@mui/icons-material/Check';
-import { FaHeart, FaHeartBroken, FaEye, FaEyeSlash, FaBan, FaLongArrowAltRight, FaHandPaper, FaLevelDownAlt } from 'react-icons/fa';
+import { useEffect, useRef, useState, type FocusEvent, type KeyboardEvent, type MouseEvent } from "react";
+import { ListItem, Box, Typography, IconButton, Menu, MenuItem, ListItemIcon, Divider, TextField, Tooltip } from "@mui/material";
+import DeleteIcon from "@mui/icons-material/Delete";
+import MoreVertIcon from "@mui/icons-material/MoreVert";
+import CheckIcon from "@mui/icons-material/Check";
+import VisibilityIcon from "@mui/icons-material/Visibility";
+import VisibilityOffIcon from "@mui/icons-material/VisibilityOff";
+import FavoriteIcon from "@mui/icons-material/Favorite";
+import HeartBrokenIcon from "@mui/icons-material/HeartBroken";
+import PanToolIcon from "@mui/icons-material/PanTool";
+import BlockIcon from "@mui/icons-material/Block";
+import EastIcon from "@mui/icons-material/East";
+import SubdirectoryArrowRightIcon from "@mui/icons-material/SubdirectoryArrowRight";
 import OBR from "@owlbear-rodeo/sdk";
 
-import { ParticipantRow as ParticipantRowType } from "../store/types";
+import type { ParticipantRow as ParticipantRowType, ParticipantType } from "../store/types";
 import { useAppSelector, useAppDispatch } from "../store/hooks";
-import { cardsLookup, selectActiveParticipant, selectPhase, selectPrivacyMode } from "../store/selectors";
-import { removeParticipant, setHold, loseHold, insertActNow, setInactive, setRevealed, setParticipantType, renameParticipant } from "../store/swadeSlice";
-import { RED_JOKER_ID, BLACK_JOKER_ID } from "../utils/cardIds";
+import { selectActiveParticipant, selectHasActed, selectPhase, selectPrivacyMode } from "../store/selectors";
+import {
+  removeParticipant,
+  setHold,
+  loseHold,
+  insertActNow,
+  setInactive,
+  setRevealed,
+  setParticipantType,
+  renameParticipant,
+  isIncapacitatedExtra,
+} from "../store/swadeSlice";
+import { getCardName, isJokerId } from "../utils/cardIds";
 import { getPluginId } from "../getPluginId";
 import { useUndo } from "../hooks/useUndo";
 import { ParticipantAvatar } from "./ParticipantAvatar";
 import { ActionCard } from "./ActionCard";
+import { RowAction } from "./RowAction";
+
+const TYPE_OPTIONS: [ParticipantType, string][] = [
+  ["PC", "PC"],
+  ["NPC", "NPC"],
+  ["GROUP", "Extra"],
+];
 
 interface ParticipantRowProps {
   participant: ParticipantRowType;
   role?: "GM" | "PLAYER";
-  isJokerAtTop: boolean;
   editingId: string | null;
   setEditingId: (id: string | null) => void;
 }
 
-export const ParticipantRow = ({ participant, role, isJokerAtTop, editingId, setEditingId }: ParticipantRowProps) => {
+export const ParticipantRow = ({ participant, role, editingId, setEditingId }: ParticipantRowProps) => {
   const dispatch = useAppDispatch();
-  const theme = useTheme();
   const activeParticipant = useAppSelector(selectActiveParticipant);
   const phase = useAppSelector(selectPhase);
   const privacyEnabled = useAppSelector(selectPrivacyMode);
+  const hasActed = useAppSelector((state) => selectHasActed(state, participant.id));
   const ref = useRef<HTMLLIElement>(null);
+  const cancelEditRef = useRef(false);
+  /** Set when the edit ends from the keyboard, so focus goes back to the name button. */
+  const restoreFocusRef = useRef(false);
+  const nameLabelRef = useRef<HTMLElement>(null);
+  const saveButtonRef = useRef<HTMLButtonElement>(null);
   const [menuAnchor, setMenuAnchor] = useState<null | HTMLElement>(null);
   const [editedName, setEditedName] = useState(participant.name);
   const { captureCheckpoint } = useUndo();
-  
+
+  const isGm = role === "GM";
   const isActive = activeParticipant?.id === participant.id;
   const isEditing = editingId === participant.id;
 
+  // The edit UI unmounts when editing ends; put keyboard focus back on the name button.
+  useEffect(() => {
+    if (!isEditing && restoreFocusRef.current) {
+      restoreFocusRef.current = false;
+      nameLabelRef.current?.focus();
+    }
+  }, [isEditing]);
+  const inRound = phase === "in_round";
+  // An incapacitated Extra cannot act: no Hold, Act Now or Lose Turn (its hold stays for when it is revived).
+  const canAct = !isIncapacitatedExtra(participant);
+  // A Joker may interrupt (Act Now / Hold) any time this round until it has acted.
+  const isUnactedJoker = canAct && isJokerId(participant.currentCardId) && !hasActed;
+
   // Auto-scroll when this participant becomes active
   useEffect(() => {
-    if (isActive && ref.current) {
-      ref.current.scrollIntoView({
-        behavior: 'smooth',
-        block: 'nearest'
-      });
-    }
+    if (isActive) ref.current?.scrollIntoView?.({ behavior: "smooth", block: "nearest" });
   }, [isActive]);
 
-  const currentCard = participant.currentCardId ? cardsLookup[participant.currentCardId] : null;
-  const isJoker = participant.currentCardId === RED_JOKER_ID || participant.currentCardId === BLACK_JOKER_ID;
-  const inRound = phase === 'in_round';
-
-  const handleMenuOpen = (event: React.MouseEvent<HTMLElement>) => {
-    setMenuAnchor(event.currentTarget);
+  /** Capture an undo checkpoint and dispatch in the same task (the undo store requires it). */
+  const act = (description: string, action: Parameters<typeof dispatch>[0]) => {
+    captureCheckpoint(description);
+    dispatch(action);
   };
 
-  const handleMenuClose = () => {
-    setMenuAnchor(null);
-  };
+  const handleMenuClose = () => setMenuAnchor(null);
 
   const handleRemove = () => {
-    captureCheckpoint(`Remove: ${participant.name}`);
-    dispatch(removeParticipant(participant.id));
     handleMenuClose();
+    act(`Remove: ${participant.name}`, removeParticipant(participant.id));
   };
 
-  const handleChangeType = (newType: 'PC' | 'NPC' | 'GROUP') => {
-    captureCheckpoint(`Change ${participant.name} to ${newType}`);
-    dispatch(setParticipantType({ id: participant.id, type: newType }));
+  const handleChangeType = (type: ParticipantType) => {
     handleMenuClose();
-  };
-
-  const handleToggleHold = () => {
-    const action = participant.onHold ? 'Remove Hold' : 'Hold';
-    captureCheckpoint(`${action}: ${participant.name}`);
-    dispatch(setHold({ id: participant.id, value: !participant.onHold }));
-  };
-
-  const handleLoseHold = () => {
-    captureCheckpoint(`Lose Hold: ${participant.name}`);
-    dispatch(loseHold(participant.id));
-  };
-
-  const handleActBefore = () => {
-    captureCheckpoint(`Act Now Before: ${participant.name}`);
-    dispatch(insertActNow({ id: participant.id, placement: 'before' }));
-  };
-
-  const handleActAfter = () => {
-    captureCheckpoint(`Act Now After: ${participant.name}`);
-    dispatch(insertActNow({ id: participant.id, placement: 'after' }));
-  };
-
-  const handleToggleRevealed = () => {
-    const action = participant.revealed ? 'Hide' : 'Reveal';
-    captureCheckpoint(`${action}: ${participant.name}`);
-    dispatch(setRevealed({ id: participant.id, value: !participant.revealed }));
-  };
-
-  const handleToggleInactive = () => {
-    const action = participant.inactive ? 'Activate' : 'Deactivate';
-    captureCheckpoint(`${action}: ${participant.name}`);
-    dispatch(setInactive({ id: participant.id, value: !participant.inactive }));
+    act(`Change ${participant.name} to ${type}`, setParticipantType({ id: participant.id, type }));
   };
 
   const handleCardClick = () => {
-    // Only GM can modify cards
-    if (role !== "GM") return;
-
-    if (currentCard || participant.candidateIds.length > 0) {
-      captureCheckpoint(`Manage Cards: ${participant.name}`);
-
-      OBR.modal.open({
+    // The modal captures its own undo checkpoints.
+    OBR.modal
+      .open({
         id: getPluginId("card-chooser"),
-        url: `/card-chooser?participantId=${participant.id}`,
+        url: `/?view=card-chooser&participantId=${encodeURIComponent(participant.id)}`,
         width: 500,
         height: 250,
-        hideBackdrop: false
-      });
-    }
+        hideBackdrop: false,
+      })
+      .catch((error) => console.error("[SWADE] Failed to open the card chooser", error));
   };
 
-  const autoSave = useCallback(() => {
-    const trimmedName = editedName.trim();
-    if (trimmedName && trimmedName !== participant.name) {
-      captureCheckpoint(`Rename: ${participant.name} → ${trimmedName}`);
-      dispatch(renameParticipant({ id: participant.id, name: trimmedName }));
-    }
-  }, [editedName, participant.name, participant.id, captureCheckpoint, dispatch]);
-
-
-  const handleNameClick = () => {
-    if (role !== "GM") return;
-    setEditingId(participant.id);
+  const startEditing = () => {
+    if (!isGm) return;
+    cancelEditRef.current = false;
     setEditedName(participant.name);
+    setEditingId(participant.id);
   };
 
-  const handleNameSave = () => {
-    autoSave();
+  /** Blur is the only save path (Enter blurs; Escape cancels, then blurs). */
+  const handleNameBlur = (event: FocusEvent<HTMLElement>) => {
+    // Tab to "Save name": that button unmounts with the edit UI, so keep focus on the row.
+    if (event.relatedTarget && event.relatedTarget === saveButtonRef.current) restoreFocusRef.current = true;
+    const trimmedName = editedName.trim();
+    if (!cancelEditRef.current && trimmedName && trimmedName !== participant.name) {
+      act(`Rename: ${participant.name} → ${trimmedName}`, renameParticipant({ id: participant.id, name: trimmedName }));
+    }
+    cancelEditRef.current = false;
     setEditingId(null);
   };
 
-  const handleNameKeyDown = (event: React.KeyboardEvent) => {
-    if (event.key === 'Enter') {
+  const handleNameKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (event.key === "Enter" || event.key === "Escape") {
       event.preventDefault();
-      handleNameSave();
+      cancelEditRef.current = event.key === "Escape";
+      restoreFocusRef.current = true;
+      // The handler sits on the input wrapper; blur the input itself.
+      (event.target as HTMLElement).blur();
     }
   };
 
+  const handleNameLabelKeyDown = (event: KeyboardEvent<HTMLElement>) => {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      startEditing();
+    }
+  };
 
+  const showHold = inRound && canAct && (isActive || isUnactedJoker);
+  const showLoseTurn = inRound && canAct && participant.onHold && !isActive;
+  const showActNow = inRound && canAct && !isActive && (participant.onHold || isUnactedJoker);
+  const currentCardId = participant.currentCardId;
 
   return (
-    <ListItem 
+    <ListItem
       ref={ref}
-      sx={{ 
-        bgcolor: isActive ? 'action.selected' : 'transparent',
+      sx={{
+        bgcolor: isActive ? "action.selected" : "transparent",
         borderLeft: 3,
-        borderColor: isActive ? 'primary.main' : 'transparent',
-        borderLeftStyle: 'solid',
+        borderColor: isActive ? "primary.main" : "transparent",
+        borderLeftStyle: "solid",
         py: 1,
-        position: 'relative',
-        '&:hover .remove-button': {
-          opacity: 1
-        }
+        position: "relative",
+        "&:hover .row-options-button": { opacity: 1 },
       }}
     >
-      {/* Card/Hold display and remove button - spans both rows on the right */}
-      <Box sx={{ 
-        position: 'absolute',
-        top: '50%',
-        right: 16,
-        transform: 'translateY(-50%)',
-        display: 'flex',
-        alignItems: 'center',
-        gap: 1,
-        justifyContent: 'flex-end',
-        zIndex: 1
-      }}>
-        {/* Menu button - only visible on hover, to the left of card */}
-        {role === "GM" && (
+      {/* Options button, card / hold marker: span both rows on the right */}
+      <Box
+        sx={{
+          position: "absolute",
+          top: "50%",
+          right: 16,
+          transform: "translateY(-50%)",
+          display: "flex",
+          alignItems: "center",
+          gap: 1,
+          justifyContent: "flex-end",
+          zIndex: 1,
+        }}
+      >
+        {isGm && (
           <>
-            <Tooltip title="Options">
+            <Tooltip disableInteractive title="Options">
               <IconButton
-                className="remove-button"
-                onClick={handleMenuOpen}
+                className="row-options-button"
+                aria-label={`Options for ${participant.name}`}
+                aria-haspopup="menu"
+                onClick={(event: MouseEvent<HTMLElement>) => setMenuAnchor(event.currentTarget)}
                 size="small"
-                sx={{ 
-                  opacity: 0,
-                  transition: 'opacity 0.2s',
-                  color: 'text.secondary',
-                  "&:hover": { 
-                    color: "primary.main"
-                  }
+                sx={{
+                  opacity: menuAnchor ? 1 : 0,
+                  transition: "opacity 0.2s",
+                  color: "text.secondary",
+                  "&:hover": { color: "primary.main" },
+                  "&:focus-visible": { opacity: 1 },
+                  "@media (hover: none)": { opacity: 1 },
                 }}
               >
-                <MoreVertIcon sx={{ fontSize: '1.25rem' }} />
+                <MoreVertIcon sx={{ fontSize: "1.25rem" }} />
               </IconButton>
             </Tooltip>
-            
+
             <Menu
               anchorEl={menuAnchor}
               open={Boolean(menuAnchor)}
               onClose={handleMenuClose}
-              anchorOrigin={{
-                vertical: 'bottom',
-                horizontal: 'left',
-              }}
-              transformOrigin={{
-                vertical: 'top',
-                horizontal: 'left',
-              }}
+              anchorOrigin={{ vertical: "bottom", horizontal: "left" }}
+              transformOrigin={{ vertical: "top", horizontal: "left" }}
             >
-              <MenuItem onClick={() => handleChangeType('PC')} dense>
-                <ListItemIcon>
-                  {participant.type === 'PC' ? <CheckIcon /> : null}
-                </ListItemIcon>
-                PC
-              </MenuItem>
-              <MenuItem onClick={() => handleChangeType('NPC')} dense>
-                <ListItemIcon>
-                  {participant.type === 'NPC' ? <CheckIcon /> : null}
-                </ListItemIcon>
-                NPC
-              </MenuItem>
-              <MenuItem onClick={() => handleChangeType('GROUP')} dense>
-                <ListItemIcon>
-                  {participant.type === 'GROUP' ? <CheckIcon /> : null}
-                </ListItemIcon>
-                Extra
-              </MenuItem>
+              {TYPE_OPTIONS.map(([type, label]) => (
+                <MenuItem key={type} onClick={() => handleChangeType(type)} dense selected={participant.type === type}>
+                  <ListItemIcon>{participant.type === type ? <CheckIcon /> : null}</ListItemIcon>
+                  {label}
+                </MenuItem>
+              ))}
               <Divider />
               <MenuItem onClick={handleRemove} dense>
                 <ListItemIcon>
@@ -252,106 +229,90 @@ export const ParticipantRow = ({ participant, role, isJokerAtTop, editingId, set
             </Menu>
           </>
         )}
-        
-        {/* Card/Hold display */}
+
         {participant.onHold ? (
-          <Box sx={{ 
-            width: '50px',
-            minWidth: '50px',
-            height: '28px', 
-            display: 'flex', 
-            alignItems: 'center', 
-            justifyContent: 'center' 
-          }}>
-            <FaHandPaper style={{ fontSize: '1.2rem', color: theme.palette.text.primary, opacity: 1 }} />
+          <Box
+            role="img"
+            aria-label="On hold"
+            sx={{ width: "50px", minWidth: "50px", height: "28px", display: "flex", alignItems: "center", justifyContent: "center" }}
+          >
+            <PanToolIcon sx={{ fontSize: "1.2rem", color: "text.primary" }} />
           </Box>
-        ) : currentCard ? (
+        ) : currentCardId ? (
           <ActionCard
-            cardId={participant.currentCardId!}
-            onClick={handleCardClick}
-            sx={{
-              cursor: role === "GM" ? 'pointer' : 'default',
-            }}
+            cardId={currentCardId}
+            onClick={isGm ? handleCardClick : undefined}
+            ariaLabel={isGm ? `${getCardName(currentCardId)} — manage cards for ${participant.name}` : undefined}
           />
         ) : null}
       </Box>
 
-      {/* Avatar on far left */}
-      <Box sx={{ mr: 1.5, display: 'flex', alignItems: 'center' }}>
-        <ParticipantAvatar 
-          imageUrl={participant.imageUrl}
-          name={participant.name}
-          type={participant.type}
-        />
+      <Box sx={{ mr: 1.5, display: "flex", alignItems: "center" }}>
+        {/* Keyed by URL so a failed image does not stick after the URL changes. */}
+        <ParticipantAvatar key={participant.imageUrl ?? ""} imageUrl={participant.imageUrl} name={participant.name} type={participant.type} />
       </Box>
 
-      {/* Main content area - leave space for card on right */}
-      <Box sx={{ 
-        display: 'flex',
-        flexDirection: 'column',
-        width: '100%',
-        pr: (participant.onHold || currentCard) ? 10 : (role === "GM" ? 4 : 2)
-        // 10 = space for 60px element + gap + menu button
-        // 4 = space for menu button on hover (GM only)
-        // 2 = minimal padding (players)
-      }}>
-        {/* Row 1: Name */}
-        <Box sx={{ mb: 0.5, display: 'flex', alignItems: 'center', minHeight: '28px' }}>
+      {/* Main content: leave space on the right for the card and options button */}
+      <Box
+        sx={{
+          display: "flex",
+          flexDirection: "column",
+          width: "100%",
+          pr: participant.onHold || currentCardId ? 10 : isGm ? 4 : 2,
+        }}
+      >
+        <Box sx={{ mb: 0.5, display: "flex", alignItems: "center", minHeight: "28px" }}>
           {isEditing ? (
             <>
               <TextField
                 value={editedName}
                 onChange={(e) => setEditedName(e.target.value)}
                 onKeyDown={handleNameKeyDown}
-                onBlur={() => {
-                  autoSave();
-                  setEditingId(null);
-                }}
+                onBlur={handleNameBlur}
+                onFocus={(e) => e.target.select()}
                 autoFocus
                 variant="standard"
                 size="small"
+                slotProps={{ htmlInput: { "aria-label": "Name" } }}
                 sx={{
                   flex: 1,
-                  '& .MuiInput-underline:before': { borderBottomColor: 'transparent' },
-                  '& .MuiInput-underline:hover:before': { borderBottomColor: 'primary.main' },
-                  '& .MuiInputBase-input': {
-                    fontWeight: isActive ? 'bold' : 'normal',
-                    fontSize: '1rem',
+                  "& .MuiInput-underline:before": { borderBottomColor: "transparent" },
+                  "& .MuiInput-underline:hover:before": { borderBottomColor: "primary.main" },
+                  "& .MuiInputBase-input": {
+                    fontWeight: isActive ? "bold" : "normal",
+                    fontSize: "1rem",
                     px: 0.5,
                     py: 0,
-                    height: '24px',
-                    lineHeight: '24px'
+                    height: "24px",
+                    lineHeight: "24px",
                   },
-                  '& .MuiInputBase-root': {
-                    mt: 0
-                  }
+                  "& .MuiInputBase-root": { mt: 0 },
                 }}
-                onFocus={(e) => e.target.select()}
               />
-              <IconButton
-                size="small"
-                onClick={handleNameSave}
-                sx={{ ml: 0.5, color: 'success.main' }}
-              >
-                <CheckIcon sx={{ fontSize: '1rem' }} />
+              {/* Clicking moves focus out of the field; its blur saves. */}
+              <IconButton ref={saveButtonRef} aria-label="Save name" size="small" sx={{ ml: 0.5, color: "success.main" }}>
+                <CheckIcon sx={{ fontSize: "1rem" }} />
               </IconButton>
             </>
           ) : (
-            <Typography 
-              variant="body1" 
-              onClick={handleNameClick}
-              sx={{ 
-                fontWeight: isActive ? 'bold' : 'normal',
-                textDecoration: participant.inactive ? 'line-through' : 'none',
+            <Typography
+              ref={nameLabelRef}
+              variant="body1"
+              onClick={isGm ? startEditing : undefined}
+              onKeyDown={isGm ? handleNameLabelKeyDown : undefined}
+              role={isGm ? "button" : undefined}
+              tabIndex={isGm ? 0 : undefined}
+              aria-label={isGm ? `Rename ${participant.name}` : undefined}
+              sx={{
+                fontWeight: isActive ? "bold" : "normal",
+                textDecoration: participant.inactive ? "line-through" : "none",
                 opacity: participant.inactive ? 0.6 : 1,
-                userSelect: 'none',
-                cursor: role === "GM" ? 'pointer' : 'default',
+                userSelect: "none",
+                cursor: isGm ? "pointer" : "default",
                 flex: 1,
                 px: 0.5,
                 borderRadius: 1,
-                '&:hover': role === "GM" ? {
-                  backgroundColor: 'action.hover'
-                } : {}
+                "&:hover": isGm ? { backgroundColor: "action.hover" } : {},
               }}
             >
               {participant.name}
@@ -359,82 +320,71 @@ export const ParticipantRow = ({ participant, role, isJokerAtTop, editingId, set
           )}
         </Box>
 
-        {/* Row 2: Action buttons */}
-        {role === "GM" && (
-          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-            {/* Visibility toggle - only show when privacy mode is enabled */}
+        {isGm && (
+          <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
             {privacyEnabled && (
-              <Tooltip title={participant.revealed ? "Hide from Players" : "Reveal to Players"}>
-                <Box
-                  onClick={handleToggleRevealed}
-                  sx={{ display: 'flex', alignItems: 'center', cursor: 'pointer' }}
-                >
-                  {participant.revealed ? (
-                    <FaEye style={{ fontSize: '1rem', color: theme.palette.text.secondary, opacity: 0.5, transition: "opacity 0.2s, color 0.2s", cursor: 'pointer' }} />
-                  ) : (
-                    <FaEyeSlash style={{ fontSize: '1rem', color: theme.palette.text.secondary, opacity: 0.5, transition: "opacity 0.2s, color 0.2s", cursor: 'pointer' }} />
-                  )}
-                </Box>
-              </Tooltip>
+              <RowAction
+                title={participant.revealed ? "Hide from Players" : "Reveal to Players"}
+                icon={participant.revealed ? <VisibilityIcon /> : <VisibilityOffIcon />}
+                onClick={() =>
+                  act(
+                    `${participant.revealed ? "Hide from Players" : "Reveal to Players"}: ${participant.name}`,
+                    setRevealed({ id: participant.id, value: !participant.revealed })
+                  )
+                }
+              />
             )}
-            
-            {/* Incapacitated toggle - always visible */}
-            <Tooltip title={participant.inactive ? "Mark as Active" : "Mark as Incapacitated"}>
-              <Box
-                onClick={handleToggleInactive}
-                sx={{ display: 'flex', alignItems: 'center', cursor: 'pointer' }}
-              >
-                {participant.inactive ? (
-                  <FaHeartBroken style={{ fontSize: '1rem', color: theme.palette.text.secondary, opacity: 0.5, transition: "opacity 0.2s, color 0.2s", cursor: 'pointer' }} />
-                ) : (
-                  <FaHeart style={{ fontSize: '1rem', color: theme.palette.text.secondary, opacity: 0.5, transition: "opacity 0.2s, color 0.2s", cursor: 'pointer' }} />
-                )}
-              </Box>
-            </Tooltip>
-            
-            {/* Hold toggle - when active and in round, or always for Jokers */}
-            {(isActive || isJoker) && inRound && (
-              <Tooltip title={participant.onHold ? "Clear Hold" : "Go on Hold"}>
-                <Box
-                  onClick={handleToggleHold}
-                  sx={{ display: 'flex', alignItems: 'center' }}
-                >
-                  <FaHandPaper style={{ fontSize: '1rem', color: theme.palette.text.secondary, opacity: 0.5, transition: "opacity 0.2s, color 0.2s", cursor: 'pointer' }} />
-                </Box>
-              </Tooltip>
+
+            <RowAction
+              title={participant.inactive ? "Mark as Active" : "Mark as Incapacitated"}
+              icon={participant.inactive ? <HeartBrokenIcon /> : <FavoriteIcon />}
+              onClick={() =>
+                act(
+                  `${participant.inactive ? "Mark as Active" : "Mark as Incapacitated"}: ${participant.name}`,
+                  setInactive({ id: participant.id, value: !participant.inactive })
+                )
+              }
+            />
+
+            {showHold && (
+              <RowAction
+                title={participant.onHold ? "Clear Hold" : "Go on Hold"}
+                icon={<PanToolIcon />}
+                onClick={() =>
+                  act(
+                    `${participant.onHold ? "Clear Hold" : "Go on Hold"}: ${participant.name}`,
+                    setHold({ id: participant.id, value: !participant.onHold })
+                  )
+                }
+              />
             )}
-            
-            {/* Lose Turn - only when held and not active and in round */}
-            {participant.onHold && !isActive && inRound && (
-              <Tooltip title="Lose Turn (Shaken/Stunned)">
-                <Box
-                  onClick={handleLoseHold}
-                  sx={{ display: 'flex', alignItems: 'center' }}
-                >
-                  <FaBan style={{ fontSize: '1rem', color: theme.palette.text.secondary, opacity: 0.5, transition: "opacity 0.2s, color 0.2s", cursor: 'pointer' }} />
-                </Box>
-              </Tooltip>
+
+            {showLoseTurn && (
+              <RowAction
+                title="Lose Turn (Shaken/Stunned)"
+                icon={<BlockIcon />}
+                onClick={() => act(`Lose Turn: ${participant.name}`, loseHold(participant.id))}
+              />
             )}
-            
-            {/* Act Now buttons - for held participants or Jokers at the top when not active and in round */}
-            {((participant.onHold || isJokerAtTop) && !isActive && inRound) && (
+
+            {showActNow && (
               <>
-                <Tooltip title="Act Now">
-                  <Box
-                    onClick={handleActBefore}
-                    sx={{ display: 'flex', alignItems: 'center' }}
-                  >
-                    <FaLongArrowAltRight style={{ fontSize: '1rem', color: theme.palette.text.secondary, opacity: 0.5, transition: "opacity 0.2s, color 0.2s", cursor: 'pointer' }} />
-                  </Box>
-                </Tooltip>
-                <Tooltip title="Act After Current Combatant">
-                  <Box
-                    onClick={handleActAfter}
-                    sx={{ display: 'flex', alignItems: 'center' }}
-                  >
-                    <FaLevelDownAlt style={{ fontSize: '1rem', color: theme.palette.text.secondary, opacity: 0.5, transition: "opacity 0.2s, color 0.2s", cursor: 'pointer' }} />
-                  </Box>
-                </Tooltip>
+                <RowAction
+                  title="Act Now"
+                  icon={<EastIcon />}
+                  onClick={() =>
+                    act(`Act Now: ${participant.name}`, insertActNow({ id: participant.id, placement: "before" }))
+                  }
+                />
+                {activeParticipant && (
+                  <RowAction
+                    title="Act After Current Combatant"
+                    icon={<SubdirectoryArrowRightIcon />}
+                    onClick={() =>
+                      act(`Act After Current Combatant: ${participant.name}`, insertActNow({ id: participant.id, placement: "after" }))
+                    }
+                  />
+                )}
               </>
             )}
           </Box>

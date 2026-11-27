@@ -76,7 +76,8 @@ export function ControlBar({ role }: ControlBarProps) {
   const canStart = phase === 'cards_dealt';
   const canEnd = phase === 'in_round';
   const canEndInitiative = phase === 'between_rounds';
-  const canNavigate = phase === 'in_round' && participantCount > 0;
+  // Prev/Next are disabled through the next/previous selectors when there is nowhere to go.
+  const canNavigate = phase === 'in_round';
   const hasParticipants = participantCount > 0;
 
   return (
@@ -101,6 +102,7 @@ export function ControlBar({ role }: ControlBarProps) {
             <>
               <Button
                 variant="contained"
+                aria-label="Previous turn"
                 onClick={handlePrevious}
                 disabled={!previousParticipant}
                 size="small"
@@ -110,6 +112,7 @@ export function ControlBar({ role }: ControlBarProps) {
               </Button>
               <Button
                 variant="contained"
+                aria-label="Next turn"
                 onClick={handleNext}
                 disabled={!nextParticipant}
                 size="small"
